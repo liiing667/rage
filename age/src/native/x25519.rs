@@ -91,6 +91,34 @@ impl Identity {
 }
 
 impl crate::Identity for Identity {
+    fn unwrap_stanzas(&self, stanzas: &[Stanza]) -> Option<Result<FileKey, DecryptError>> {
+        let mut file_key = None;
+
+        for stanza in stanzas {
+            if stanza.tag != X25519_RECIPIENT_TAG {
+                continue;
+            }
+
+            match self.unwrap_stanza(stanza) {
+                None => continue,
+                Some(Ok(decrypted_file_key)) => {
+                    // An X25519 identity can match at most one recipient stanza in a
+                    // well-formed header. A second stanza that also decrypts means the
+                    // same identity is being used to make either a duplicate or a
+                    // conflicting claim about the file key.
+                    if file_key.is_some() {
+                        return Some(Err(DecryptError::InvalidHeader));
+                    }
+
+                    file_key = Some(decrypted_file_key);
+                }
+                Some(Err(e)) => return Some(Err(e)),
+            }
+        }
+
+        file_key.map(Ok)
+    }
+
     fn unwrap_stanza(&self, stanza: &Stanza) -> Option<Result<FileKey, DecryptError>> {
         if stanza.tag != X25519_RECIPIENT_TAG {
             return None;

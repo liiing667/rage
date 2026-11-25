@@ -10,6 +10,13 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- `age::x25519::Identity` now rejects a header containing more than one X25519
+  recipient stanza that decrypts to the same identity. This covers both exact
+  duplicate stanzas and stanzas that make conflicting file-key claims for the
+  same identity. Distinct recipients and unrelated noise stanzas are still
+  accepted.
+
 ### Changed
 - MSRV is now 1.85.0.
 - Migrated to `chacha20poly1305 0.11`, `curve25519-dalek 5`, `hmac 0.13`,
