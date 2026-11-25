@@ -1,7 +1,7 @@
 //! File I/O helpers for CLI binaries.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -22,6 +22,8 @@ enum FileError {
     DetectedBinaryOutput,
     InvalidFilename(String),
     MissingDirectory(String),
+    RefuseSymlinkOutput(String),
+    TargetIdentityChanged(String),
 }
 
 impl fmt::Display for FileError {
@@ -42,6 +44,14 @@ impl fmt::Display for FileError {
                 wfl!(f, "err-invalid-filename", filename = filename.as_str())
             }
             Self::MissingDirectory(path) => wfl!(f, "err-missing-directory", path = path.as_str()),
+            Self::RefuseSymlinkOutput(filename) => {
+                wfl!(f, "err-refuse-symlink-output", filename = filename.as_str())
+            }
+            Self::TargetIdentityChanged(filename) => wfl!(
+                f,
+                "err-output-target-identity-changed",
+                filename = filename.as_str()
+            ),
         }
     }
 }
@@ -271,44 +281,195 @@ impl Write for StdoutWriter {
     }
 }
 
+/// The stable identity of a checked output target.
+///
+/// On Unix this is the `(st_dev, st_ino)` pair. The owned [`File`] remains bound
+/// to that object even if a path component is renamed or replaced later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    unsupported: (),
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(_metadata: &fs::Metadata) -> Self {
+        Self { unsupported: () }
+    }
+
+    fn of_file(file: &File) -> io::Result<Self> {
+        Ok(Self::from_metadata(&file.metadata()?))
+    }
+
+    fn at_path(path: &Path) -> io::Result<Self> {
+        Ok(Self::from_metadata(&fs::metadata(path)?))
+    }
+}
+
+/// An opened [`File`] together with the identity it was checked against.
+#[derive(Debug)]
+struct BoundFile {
+    inner: File,
+    identity: FileIdentity,
+}
+
+impl BoundFile {
+    /// Ensure the visible path still resolves to the exact object bound to
+    /// this writer.
+    ///
+    /// The actual writes always use the owned file descriptor, so a losing race
+    /// cannot redirect bytes. This check additionally turns a deterministic
+    /// post-check replacement into an explicit closed failure.
+    fn verify_path(&self, filename: &str) -> io::Result<()> {
+        let current = FileIdentity::at_path(Path::new(filename)).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                identity_changed_error(filename)
+            } else {
+                error
+            }
+        })?;
+
+        if current != self.identity {
+            return Err(identity_changed_error(filename));
+        }
+
+        Ok(())
+    }
+}
+
+fn symlink_output_error(filename: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        FileError::RefuseSymlinkOutput(filename.to_owned()),
+    )
+}
+
+fn identity_changed_error(filename: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        FileError::TargetIdentityChanged(filename.to_owned()),
+    )
+}
+
+/// The final path component observed by [`OutputWriter::new`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckedTarget {
+    /// The path did not exist; opening must claim it with `O_CREAT | O_EXCL`.
+    Absent,
+    /// The final component was a symlink; consumption must fail closed.
+    Symlink,
+    /// A non-symlink object with an identity bound to the eventual descriptor.
+    Identity(FileIdentity),
+}
+
+/// Check the final path component without following an unexamined symlink.
+fn check_output_path(file_path: &Path) -> io::Result<CheckedTarget> {
+    let metadata = match fs::symlink_metadata(file_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(CheckedTarget::Absent),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Ok(CheckedTarget::Symlink);
+    }
+
+    Ok(CheckedTarget::Identity(FileIdentity::from_metadata(
+        &metadata,
+    )))
+}
+
 /// A lazy [`File`] that is not opened until the first call to [`Write::write`] or
 /// [`Write::flush`].
 #[derive(Debug)]
 pub struct LazyFile {
     filename: String,
     allow_overwrite: bool,
+    /// Path state and identity checked in [`OutputWriter::new`].
+    checked_target: CheckedTarget,
     #[cfg(unix)]
     mode: u32,
-    file: Option<io::Result<File>>,
+    file: Option<io::Result<BoundFile>>,
 }
 
 impl LazyFile {
+    fn open_checked(&self) -> io::Result<BoundFile> {
+        let mut options = OpenOptions::new();
+        options.write(true);
+
+        let expected_identity = match self.checked_target {
+            CheckedTarget::Symlink => return Err(symlink_output_error(&self.filename)),
+            CheckedTarget::Absent => None,
+            CheckedTarget::Identity(identity) => Some(identity),
+        };
+
+        if !self.allow_overwrite || expected_identity.is_none() {
+            // `create_new` is atomic: it claims an absent path and rejects a
+            // file or symlink inserted after the constructor check.
+            options.create_new(true);
+        } else {
+            // Open the constructor-checked existing object without `O_TRUNC`
+            // or `O_CREAT`. We verify the identity before destroying its
+            // contents, and never create through a swapped dangling link.
+            options.create(false).truncate(false);
+        }
+
+        #[cfg(unix)]
+        options.mode(self.mode);
+
+        let file = options.open(&self.filename)?;
+        let identity = FileIdentity::of_file(&file)?;
+
+        if let Some(expected_identity) = expected_identity {
+            if identity != expected_identity {
+                return Err(identity_changed_error(&self.filename));
+            }
+
+            // Truncate only after the open descriptor is proven to point at
+            // the constructor-checked object. Skip non-regular targets such
+            // as `/dev/null`, where `ftruncate` is not meaningful.
+            if file.metadata()?.is_file() {
+                file.set_len(0)?;
+            }
+        }
+
+        Ok(BoundFile {
+            inner: file,
+            identity,
+        })
+    }
+
     fn get_file(&mut self) -> io::Result<&mut File> {
         let filename = &self.filename;
 
         if self.file.is_none() {
-            let mut options = OpenOptions::new();
-            options.write(true);
-            if self.allow_overwrite {
-                options.create(true).truncate(true);
-            } else {
-                // In addition to the check in `OutputWriter::new`, we enforce this at
-                // file opening time to avoid a race condition with the file being
-                // separately created between `OutputWriter` construction and usage.
-                options.create_new(true);
-            }
-
-            #[cfg(unix)]
-            options.mode(self.mode);
-
-            self.file = Some(options.open(filename));
+            self.file = Some(self.open_checked());
         }
 
-        self.file
-            .as_mut()
-            .unwrap()
-            .as_mut()
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open file '{filename}'")))
+        let bound = self.file.as_mut().unwrap().as_mut().map_err(|e| {
+            io::Error::new(e.kind(), format!("Failed to open file '{filename}': {e}"))
+        })?;
+
+        // If the path was replaced after the previous successful check, fail
+        // closed before the next write. The owned descriptor remains bound to
+        // the checked identity regardless of this path-based verification.
+        bound.verify_path(filename)?;
+
+        Ok(&mut bound.inner)
     }
 }
 
@@ -339,6 +500,11 @@ impl OutputWriter {
     ///
     /// If `allow_overwrite` is `true`, the file at path `output` will be overwritten if
     /// it exists. This option has no effect if `output` is `None` or `Some("-")`.
+    ///
+    /// Output paths are checked for symlinks and their object identity is
+    /// recorded. The eventual file descriptor is compared with that identity
+    /// before any truncation or plaintext write; a replaced target fails
+    /// closed instead of following the new path.
     pub fn new(
         output: Option<String>,
         allow_overwrite: bool,
@@ -380,9 +546,12 @@ impl OutputWriter {
                     ));
                 }
 
+                let checked_target = check_output_path(file_path)?;
+
                 return Ok(OutputWriter::File(LazyFile {
                     filename,
                     allow_overwrite,
+                    checked_target,
                     #[cfg(unix)]
                     mode: _mode,
                     file: None,

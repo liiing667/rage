@@ -50,6 +50,10 @@ err-invalid-filename = invalid filename '{$filename}'.
 
 err-missing-directory = directory '{$path}' does not exist.
 
+err-refuse-symlink-output = refusing to write output through symbolic link '{$filename}'.
+
+err-output-target-identity-changed = refusing to write output to '{$filename}': checked target identity changed; the path may have been replaced by a symbolic link.
+
 ## Identity file errors
 
 err-failed-to-write-output = Failed to write to output: {$err}

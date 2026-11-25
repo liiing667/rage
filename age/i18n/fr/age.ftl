@@ -46,6 +46,10 @@ rec-deny-binary-output = Est-ce que vous vouliez utiliser {-flag-armor}? {rec-de
 
 err-deny-overwrite-file = refus d'écraser le fichier existant '{$filename}'.
 
+err-refuse-symlink-output = refus d'écrire la sortie à travers le lien symbolique '{$filename}'.
+
+err-output-target-identity-changed = refus d'écrire la sortie dans '{$filename}' : l'identité de la cible vérifiée a changé ; le chemin a peut-être été remplacé par un lien symbolique.
+
 ## Identity file errors
 
 err-failed-to-write-output = Echec d'écriture vers la sortie: {$err}
