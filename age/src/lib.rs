@@ -222,7 +222,10 @@ mod protocol;
 mod util;
 
 pub use error::{DecryptError, EncryptError, IdentityFileConvertError};
-pub use identity::IdentityFile;
+pub use identity::{
+    IdentityBindingError, IdentityBindingReport, IdentityFile, RecipientBinding,
+    RecipientBindingStatus,
+};
 pub use primitives::stream;
 pub use protocol::{Decryptor, Encryptor};
 

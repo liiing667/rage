@@ -317,6 +317,8 @@ impl std::error::Error for EncryptError {
 pub enum DecryptError {
     /// The age file failed to decrypt.
     DecryptionFailed,
+    /// An identity file's recipient evidence did not bind to its decrypted subject.
+    IdentityBinding(crate::IdentityBindingError),
     /// The age file used an excessive work factor for passphrase encryption.
     ExcessiveWork {
         /// The work factor required to decrypt.
@@ -350,6 +352,7 @@ impl Clone for DecryptError {
     fn clone(&self) -> Self {
         match self {
             Self::DecryptionFailed => Self::DecryptionFailed,
+            Self::IdentityBinding(e) => Self::IdentityBinding(e.clone()),
             Self::ExcessiveWork { required, target } => Self::ExcessiveWork {
                 required: *required,
                 target: *target,
@@ -372,6 +375,7 @@ impl fmt::Display for DecryptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DecryptError::DecryptionFailed => wfl!(f, "err-decryption-failed"),
+            DecryptError::IdentityBinding(e) => write!(f, "{e}"),
             DecryptError::ExcessiveWork { required, target } => {
                 wlnfl!(f, "err-excessive-work")?;
                 wfl!(
@@ -437,6 +441,7 @@ impl std::error::Error for DecryptError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DecryptError::Io(inner) => Some(inner),
+            DecryptError::IdentityBinding(inner) => Some(inner),
             _ => None,
         }
     }

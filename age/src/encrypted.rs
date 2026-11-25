@@ -2,7 +2,10 @@
 
 use std::{cell::Cell, io};
 
-use crate::{Callbacks, DecryptError, Decryptor, EncryptError, IdentityFile, fl, scrypt};
+use crate::{
+    Callbacks, DecryptError, Decryptor, EncryptError, IdentityBindingError, IdentityBindingReport,
+    IdentityFile, fl, scrypt,
+};
 
 /// An encrypted age identity file.
 ///
@@ -68,7 +71,16 @@ impl<R: io::Read, C: Callbacks> EncryptedIdentity<R, C> {
                 }
             })
             .and_then(|stream| {
-                let file = IdentityFile::from_buffer(io::BufReader::new(stream))?
+                let file = IdentityFile::from_buffer(io::BufReader::new(stream))
+                    .map_err(|error| {
+                        match error
+                            .get_ref()
+                            .and_then(|inner| inner.downcast_ref::<IdentityBindingError>())
+                        {
+                            Some(binding) => DecryptError::IdentityBinding(binding.clone()),
+                            None => DecryptError::Io(error),
+                        }
+                    })?
                     .with_callbacks(self.callbacks);
                 Ok(file)
             })
@@ -152,6 +164,25 @@ impl<R: io::Read, C: Callbacks> Identity<R, C> {
             Err(e) => {
                 self.state.set(IdentityState::Poisoned(Some(e.clone())));
                 Err(EncryptError::EncryptedIdentities(e))
+            }
+        }
+    }
+
+    /// Decrypts if necessary and returns the generation/subject binding evidence.
+    ///
+    /// A mismatched recipient comment is returned as
+    /// [`DecryptError::IdentityBinding`] and also poisons this identity, ensuring the
+    /// same unverified evidence cannot be reused later.
+    pub fn binding_report(&self) -> Result<IdentityBindingReport, DecryptError> {
+        match self.state.take().decrypt(self.filename.as_deref()) {
+            Ok((identity_file, _)) => {
+                let report = identity_file.binding_report();
+                self.state.set(IdentityState::Decrypted(identity_file));
+                Ok(report)
+            }
+            Err(error) => {
+                self.state.set(IdentityState::Poisoned(Some(error.clone())));
+                Err(error)
             }
         }
     }

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "event": "identity_subject_binding",
+  "generation": "review-record-example",
+  "audit_generation": "identity-gen-4-1795567555242412374-0",
+  "claimed_generation": "review-record-example",
+  "filename": null,
+  "complete": false,
+  "bindings": [
+    {
+      "line_number": 3,
+      "generation": "review-record-example",
+      "claimed_generation": "review-record-example",
+      "declared_recipients": [
+        "age1ysxuaeqlk7xd8uqsh8lsnfwt9jzzjlqf49ruhpjrrj5yatlcuf7qke4pqe"
+      ],
+      "subject_evidence": "age1t7rxyev2z3rw82stdlrrepyc39nvn86l5078zqkf5uasdy86jp6svpy7pa",
+      "status": "mismatch"
+    }
+  ]
+}
