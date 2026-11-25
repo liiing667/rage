@@ -8,6 +8,12 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- `age_core::plugin::Connection` now treats the terminal `done` frame as the commit
+  boundary for plugin replies. A reply that ends early, or whose `done` frame carries
+  metadata or data, is rejected. `Connection::bidir_receive_transactional` stages result
+  frames until a complete terminal frame has been validated.
+
 ### Changed
 - MSRV is now 1.85.0.
 - Migrated to `chacha20poly1305 0.11`, `hpke 0.14`.

@@ -23,6 +23,8 @@ mod error;
 
 mod i18n;
 
+mod security_record;
+
 #[macro_export]
 macro_rules! fl {
     ($message_id:literal) => {{
@@ -394,9 +396,18 @@ fn main() -> Result<(), error::Error> {
         }
     }
 
-    if opts.decrypt {
+    let audit = security_record::OperationAudit::new(
+        if opts.decrypt { "decrypt" } else { "encrypt" },
+        opts.input.clone(),
+        opts.output.clone(),
+        security_record::plugin_requested(&opts.plugin_name, &opts.recipient, &opts.identity),
+    );
+
+    let result = if opts.decrypt {
         decrypt(opts).map_err(error::Error::from)
     } else {
         encrypt(opts).map_err(error::Error::from)
-    }
+    };
+    security_record::write_receipt(&audit, &result);
+    result
 }

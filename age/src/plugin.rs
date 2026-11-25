@@ -268,7 +268,7 @@ struct BlastFurnace {
 }
 
 impl BlastFurnace {
-    fn handle_errors(&self, res: io::Result<()>) -> io::Result<()> {
+    fn handle_errors<T>(&self, res: io::Result<T>) -> io::Result<T> {
         res.map_err(|e| match e.kind() {
             io::ErrorKind::UnexpectedEof => io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -290,11 +290,18 @@ impl BlastFurnace {
         self.handle_errors(res)
     }
 
-    fn bidir_receive<H>(&mut self, commands: &[&str], handler: H) -> io::Result<()>
+    fn bidir_receive_transactional<H>(
+        &mut self,
+        commands: &[&str],
+        result_commands: &[&str],
+        handler: H,
+    ) -> io::Result<Vec<Stanza>>
     where
         H: FnMut(Stanza, Reply<DebugReader<ChildStdout>, DebugWriter<ChildStdin>>) -> Response,
     {
-        let res = self.conn.bidir_receive(commands, handler);
+        let res = self
+            .conn
+            .bidir_receive_transactional(commands, result_commands, handler);
         self.handle_errors(res)
     }
 }
@@ -367,6 +374,147 @@ fn handle_confirm<R: io::Read, W: io::Write, C: Callbacks>(
     }
 }
 
+/// Applies one validated `recipient-v1` result frame after the terminal frame has been
+/// received.
+fn handle_recipient_result(
+    mut command: Stanza,
+    recipients: &[Recipient],
+    identities: &[Identity],
+    stanzas: &mut Vec<Stanza>,
+    labels: &mut Option<HashSet<String>>,
+    errors: &mut Vec<PluginError>,
+) {
+    match command.tag.as_str() {
+        CMD_RECIPIENT_STANZA => {
+            if command.args.len() >= 2 {
+                // We only requested one file key be wrapped.
+                if command.args.remove(0) == "0" {
+                    command.tag = command.args.remove(0);
+                    stanzas.push(command);
+                } else {
+                    errors.push(PluginError::Other {
+                        kind: "internal".to_owned(),
+                        metadata: vec![],
+                        message: "plugin wrapped file key to a file we didn't provide".to_owned(),
+                    });
+                }
+            } else {
+                errors.push(PluginError::Other {
+                    kind: "internal".to_owned(),
+                    metadata: vec![],
+                    message: format!(
+                        "{CMD_RECIPIENT_STANZA} command must have at least two metadata arguments"
+                    ),
+                });
+            }
+        }
+        CMD_LABELS => {
+            if labels.is_none() {
+                let labels_count = command.args.len();
+                let label_set = command.args.into_iter().collect::<HashSet<_>>();
+                if label_set.len() == labels_count {
+                    *labels = Some(label_set);
+                } else {
+                    errors.push(PluginError::Other {
+                        kind: "internal".to_owned(),
+                        metadata: vec![],
+                        message: format!("{CMD_LABELS} command must not contain duplicate labels"),
+                    });
+                }
+            } else {
+                errors.push(PluginError::Other {
+                    kind: "internal".to_owned(),
+                    metadata: vec![],
+                    message: format!("{CMD_LABELS} command must not be sent more than once"),
+                });
+            }
+        }
+        CMD_ERROR => {
+            if command.args.len() == 2 && command.args[0] == "recipient" {
+                if let Some(r) = command.args[1]
+                    .parse()
+                    .ok()
+                    .and_then(|index: usize| recipients.get(index))
+                {
+                    errors.push(PluginError::Recipient {
+                        binary_name: binary_name(&r.name),
+                        recipient: r.recipient.clone(),
+                        message: String::from_utf8_lossy(&command.body).to_string(),
+                    });
+                } else {
+                    errors.push(PluginError::from(command));
+                }
+            } else if command.args.len() == 2 && command.args[0] == "identity" {
+                if let Some(identity) = command.args[1]
+                    .parse()
+                    .ok()
+                    .and_then(|index: usize| identities.get(index))
+                {
+                    errors.push(PluginError::Identity {
+                        binary_name: binary_name(&identity.name),
+                        message: String::from_utf8_lossy(&command.body).to_string(),
+                    });
+                } else {
+                    errors.push(PluginError::from(command));
+                }
+            } else {
+                errors.push(PluginError::from(command));
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Applies one validated `identity-v1` result frame after the terminal frame has been
+/// received.
+fn handle_identity_result(
+    command: Stanza,
+    identities: &[Identity],
+    file_key: &mut Option<Result<FileKey, DecryptError>>,
+    errors: &mut Vec<PluginError>,
+) {
+    match command.tag.as_str() {
+        CMD_FILE_KEY => {
+            // We only requested one file key be unwrapped.
+            if command.args.len() == 1 && command.args[0] == "0" && file_key.is_none() {
+                *file_key = Some(FileKey::try_init_with_mut(|file_key| {
+                    if command.body.len() == file_key.len() {
+                        file_key.copy_from_slice(&command.body);
+                        Ok(())
+                    } else {
+                        Err(DecryptError::DecryptionFailed)
+                    }
+                }));
+            } else {
+                errors.push(PluginError::Other {
+                    kind: "internal".to_owned(),
+                    metadata: vec![],
+                    message: format!("{CMD_FILE_KEY} command must name file 0 exactly once"),
+                });
+            }
+        }
+        CMD_ERROR => {
+            if command.args.len() == 2 && command.args[0] == "identity" {
+                if let Some(identity) = command.args[1]
+                    .parse()
+                    .ok()
+                    .and_then(|index: usize| identities.get(index))
+                {
+                    errors.push(PluginError::Identity {
+                        binary_name: binary_name(&identity.name),
+                        message: String::from_utf8_lossy(&command.body).to_string(),
+                    });
+                } else {
+                    errors.push(PluginError::from(command));
+                }
+            } else {
+                errors.push(PluginError::from(command));
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// An age plugin with an associated set of recipients.
 ///
 /// This struct implements [`Recipient`], enabling the plugin to encrypt a file to the
@@ -434,7 +582,7 @@ impl<C: Callbacks> crate::Recipient for RecipientPluginV1<C> {
         let mut stanzas = vec![];
         let mut labels = None;
         let mut errors = vec![];
-        if let Err(e) = conn.bidir_receive(
+        let result_frames = conn.bidir_receive_transactional(
             &[
                 CMD_MSG,
                 CMD_CONFIRM,
@@ -444,7 +592,8 @@ impl<C: Callbacks> crate::Recipient for RecipientPluginV1<C> {
                 CMD_LABELS,
                 CMD_ERROR,
             ],
-            |mut command, reply| match command.tag.as_str() {
+            &[CMD_RECIPIENT_STANZA, CMD_LABELS, CMD_ERROR],
+            |command, reply| match command.tag.as_str() {
                 CMD_MSG => {
                     self.callbacks
                         .display_message(&String::from_utf8_lossy(&command.body));
@@ -469,95 +618,21 @@ impl<C: Callbacks> crate::Recipient for RecipientPluginV1<C> {
                         _ => reply.fail(),
                     }
                 }
-                CMD_RECIPIENT_STANZA => {
-                    if command.args.len() >= 2 {
-                        // We only requested one file key be wrapped.
-                        if command.args.remove(0) == "0" {
-                            command.tag = command.args.remove(0);
-                            stanzas.push(command);
-                        } else {
-                            errors.push(PluginError::Other {
-                                kind: "internal".to_owned(),
-                                metadata: vec![],
-                                message: "plugin wrapped file key to a file we didn't provide"
-                                    .to_owned(),
-                            });
-                        }
-                    } else {
-                        errors.push(PluginError::Other {
-                            kind: "internal".to_owned(),
-                            metadata: vec![],
-                            message: format!(
-                                "{CMD_RECIPIENT_STANZA} command must have at least two metadata arguments"
-                            ),
-                        });
-                    }
-                    reply.ok(None)
-                }
-                CMD_LABELS => {
-                    if labels.is_none() {
-                        let labels_count = command.args.len();
-                        let label_set = command.args.into_iter().collect::<HashSet<_>>();
-                        if label_set.len() == labels_count {
-                            labels = Some(label_set);
-                        } else {
-                            errors.push(PluginError::Other {
-                                kind: "internal".to_owned(),
-                                metadata: vec![],
-                                message: format!(
-                                    "{CMD_LABELS} command must not contain duplicate labels"
-                                ),
-                            });
-                        }
-                    } else {
-                        errors.push(PluginError::Other {
-                            kind: "internal".to_owned(),
-                            metadata: vec![],
-                            message: format!(
-                                "{CMD_LABELS} command must not be sent more than once"
-                            ),
-                        });
-                    }
-                    reply.ok(None)
-                }
-                CMD_ERROR => {
-                    if command.args.len() == 2 && command.args[0] == "recipient" {
-                        if let Some(r) = command.args[1]
-                            .parse()
-                            .ok()
-                            .and_then(|index: usize| self.recipients.get(index))
-                        {
-                            errors.push(PluginError::Recipient {
-                                binary_name: binary_name(&r.name),
-                                recipient: r.recipient.clone(),
-                                message: String::from_utf8_lossy(&command.body).to_string(),
-                            });
-                        } else {
-                            errors.push(PluginError::from(command));
-                        }
-                    } else if command.args.len() == 2 && command.args[0] == "identity" {
-                        if let Some(identity) = command.args[1]
-                            .parse()
-                            .ok()
-                            .and_then(|index: usize| self.identities.get(index))
-                        {
-                            errors.push(PluginError::Identity {
-                                binary_name: binary_name(&identity.name),
-                                message: String::from_utf8_lossy(&command.body).to_string(),
-                            });
-                        } else {
-                            errors.push(PluginError::from(command));
-                        }
-                    } else {
-                        errors.push(PluginError::from(command));
-                    }
-                    reply.ok(None)
-                }
+                CMD_RECIPIENT_STANZA | CMD_LABELS | CMD_ERROR => reply.ok(None),
                 _ => unreachable!(),
             },
-        ) {
-            return Err(e.into());
-        };
+        )?;
+
+        for command in result_frames {
+            handle_recipient_result(
+                command,
+                &self.recipients,
+                &self.identities,
+                &mut stanzas,
+                &mut labels,
+                &mut errors,
+            );
+        }
         match (stanzas.is_empty(), errors.is_empty()) {
             (false, true) => Ok((stanzas, labels.unwrap_or_default())),
             (a, b) => {
@@ -646,7 +721,7 @@ impl<C: Callbacks> IdentityPluginV1<C> {
         // Phase 2: interactively unwrap
         let mut file_key = None;
         let mut errors = vec![];
-        if let Err(e) = conn.bidir_receive(
+        let result_frames = match conn.bidir_receive_transactional(
             &[
                 CMD_MSG,
                 CMD_CONFIRM,
@@ -655,6 +730,7 @@ impl<C: Callbacks> IdentityPluginV1<C> {
                 CMD_FILE_KEY,
                 CMD_ERROR,
             ],
+            &[CMD_FILE_KEY, CMD_ERROR],
             |command, reply| match command.tag.as_str() {
                 CMD_MSG => {
                     self.callbacks
@@ -682,44 +758,23 @@ impl<C: Callbacks> IdentityPluginV1<C> {
                 }
                 CMD_FILE_KEY => {
                     // We only requested one file key be unwrapped.
-                    if command.args.len() == 1 && command.args[0] == "0" && file_key.is_none() {
-                        file_key = Some(FileKey::try_init_with_mut(|file_key| {
-                            if command.body.len() == file_key.len() {
-                                file_key.copy_from_slice(&command.body);
-                                Ok(())
-                            } else {
-                                Err(DecryptError::DecryptionFailed)
-                            }
-                        }));
+                    if command.args.len() == 1 && command.args[0] == "0" {
                         reply.ok(None)
                     } else {
                         reply.fail()
                     }
                 }
-                CMD_ERROR => {
-                    if command.args.len() == 2 && command.args[0] == "identity" {
-                        if let Some(identity) = command.args[1]
-                            .parse()
-                            .ok()
-                            .and_then(|index: usize| self.identities.get(index))
-                        {
-                            errors.push(PluginError::Identity {
-                                binary_name: binary_name(&identity.name),
-                                message: String::from_utf8_lossy(&command.body).to_string(),
-                            });
-                        } else {
-                            errors.push(PluginError::from(command));
-                        }
-                    } else {
-                        errors.push(PluginError::from(command));
-                    }
-                    reply.ok(None)
-                }
+                CMD_ERROR => reply.ok(None),
                 _ => unreachable!(),
             },
         ) {
-            return Some(Err(e.into()));
+            Ok(frames) => frames,
+            Err(e) => return Some(Err(e.into())),
         };
+
+        for command in result_frames {
+            handle_identity_result(command, &self.identities, &mut file_key, &mut errors);
+        }
 
         if file_key.is_none() && !errors.is_empty() {
             Some(Err(DecryptError::Plugin(errors)))

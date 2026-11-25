@@ -10,6 +10,12 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- `age::plugin::{RecipientPluginV1, IdentityPluginV1}` now commit plugin result frames
+  only after the complete reply has been parsed and its empty terminal `done` frame has
+  been validated. A plugin reply that ends early no longer exposes partial recipient
+  stanzas or file keys to the caller.
+
 ### Changed
 - MSRV is now 1.85.0.
 - Migrated to `chacha20poly1305 0.11`, `curve25519-dalek 5`, `hmac 0.13`,

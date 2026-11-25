@@ -343,9 +343,27 @@ pub(crate) fn run_v1<P: IdentityPluginV1>(mut plugin: P) -> io::Result<()> {
             }
         };
 
+        let file_count = stanzas.len();
         let unwrapped = plugin.unwrap_file_keys(stanzas, BidirCallbacks(&mut phase))?;
 
+        // Stage the complete response before publishing any results. A response cannot
+        // name a file that the client did not provide, and no file-key/error frames are
+        // written until every returned file index has been validated.
+        let mut planned = Vec::new();
         for (file_index, file_key) in unwrapped {
+            if file_index >= file_count {
+                Error::Internal {
+                    message: format!(
+                        "plugin returned a result for file {file_index}, but only {file_count} file(s) were provided"
+                    ),
+                }
+                .send(&mut phase)?;
+                return Ok(());
+            }
+            planned.push((file_index, file_key));
+        }
+
+        for (file_index, file_key) in planned {
             match file_key {
                 Ok(file_key) => {
                     phase

@@ -12,6 +12,12 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- Encrypt/decrypt invocations now write a non-secret `security-receipt.json` /
+  `security-receipt.jsonl` record in the working directory. Plugin frame transactions are
+  committed only after a complete terminal frame; rejected or incomplete replies record
+  that partial recipient results were not published.
+
 ### Changed
 - MSRV is now 1.85.0.
 - MSRV for `rage-mount` (behind the `mount` feature flag) is now 1.88.0.

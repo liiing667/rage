@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "task_id": "rage-t08-plugin-frame-transaction",
+  "event": "plugin_frame_transaction",
+  "baseline": "str4d/rage@b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f",
+  "risk": "partial recipient results published from an incomplete plugin reply",
+  "security_control": "terminal-frame commit gate",
+  "terminal_frame": "done",
+  "commit_boundary": "result frames are returned only after a complete empty done frame",
+  "rejected_cases": [
+    "EOF before done after one or more complete result frames",
+    "done frame with metadata or data",
+    "partial wrap_file_keys file/recipient results",
+    "identity result for a file index that was not provided"
+  ],
+  "compatibility": [
+    "valid unidirectional plugin phases",
+    "valid bidirectional plugin phases with an empty done frame"
+  ],
+  "evidence": {
+    "runtime_receipt": "security-receipt.json + security-receipt.jsonl in the operation cwd",
+    "partial_recipient_results_published": false,
+    "review_record": "docs/security-plugin-frame-transaction.md"
+  }
+}

@@ -258,6 +258,40 @@ impl Error {
     }
 }
 
+/// Validates a complete `wrap_file_keys` response before any recipient stanza is sent.
+/// A partial response is converted into an internal error instead of being published.
+fn plan_recipient_stanzas(
+    files: Vec<Vec<Stanza>>,
+    expected_files: usize,
+    expected_stanzas: usize,
+) -> Result<Vec<(usize, Stanza)>, Error> {
+    if files.len() != expected_files {
+        return Err(Error::Internal {
+            message: format!(
+                "plugin returned {} file result(s) for {expected_files} file key(s)",
+                files.len()
+            ),
+        });
+    }
+
+    let mut planned = Vec::new();
+    for (file_index, stanzas) in files.into_iter().enumerate() {
+        // The plugin MUST generate an error if one or more recipients or identities
+        // cannot be wrapped to.
+        if stanzas.len() < expected_stanzas {
+            return Err(Error::Internal {
+                message: format!(
+                    "plugin returned {} stanza(s) for file {file_index}, but {expected_stanzas} recipient/identity result(s) were required",
+                    stanzas.len()
+                ),
+            });
+        }
+
+        planned.extend(stanzas.into_iter().map(|stanza| (file_index, stanza)));
+    }
+    Ok(planned)
+}
+
 /// Runs the recipient plugin v1 protocol.
 pub(crate) fn run_v1<P: RecipientPluginV1>(mut plugin: P) -> io::Result<()> {
     let mut conn = Connection::accept();
@@ -454,18 +488,26 @@ pub(crate) fn run_v1<P: RecipientPluginV1>(mut plugin: P) -> io::Result<()> {
         // response if `labels` is empty (where it does not matter).
         let _ = phase.send(LABELS, &labels, &[])?;
 
+        let expected_files = file_keys.len();
         match plugin.wrap_file_keys(file_keys, BidirCallbacks(&mut phase))? {
             Ok(files) => {
-                for (file_index, stanzas) in files.into_iter().enumerate() {
-                    // The plugin MUST generate an error if one or more recipients or
-                    // identities cannot be wrapped to.
-                    assert!(stanzas.len() >= expected_stanzas);
-
-                    for stanza in stanzas {
-                        phase
-                            .send_stanza(RECIPIENT_STANZA, &[&file_index.to_string()], &stanza)?
-                            .unwrap();
+                // Do not publish any recipient stanzas until the complete response has
+                // been validated. In particular, a plugin that returns only a prefix of
+                // the required file or recipient results must not cause the client to
+                // observe a partial success.
+                let planned = match plan_recipient_stanzas(files, expected_files, expected_stanzas)
+                {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        error.send(&mut phase)?;
+                        return Ok(());
                     }
+                };
+
+                for (file_index, stanza) in planned {
+                    phase
+                        .send_stanza(RECIPIENT_STANZA, &[&file_index.to_string()], &stanza)?
+                        .unwrap();
                 }
             }
             Err(errors) => {
@@ -477,4 +519,50 @@ pub(crate) fn run_v1<P: RecipientPluginV1>(mut plugin: P) -> io::Result<()> {
 
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stanza(tag: &str) -> Stanza {
+        Stanza {
+            tag: tag.to_owned(),
+            args: vec![],
+            body: vec![],
+        }
+    }
+
+    #[test]
+    fn partial_file_results_are_not_planned_for_publication() {
+        let err = plan_recipient_stanzas(vec![], 1, 2).err().unwrap();
+        assert!(matches!(
+            err,
+            Error::Internal { message } if message.contains("1 file key")
+        ));
+    }
+
+    #[test]
+    fn partial_recipient_results_are_not_planned_for_publication() {
+        let err = plan_recipient_stanzas(vec![vec![stanza("one")]], 1, 2)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::Internal { message } if message.contains("2 recipient/identity result")
+        ));
+    }
+
+    #[test]
+    fn complete_recipient_results_are_planned_together() {
+        let planned = plan_recipient_stanzas(
+            vec![vec![stanza("one"), stanza("two"), stanza("extra")]],
+            1,
+            2,
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(planned.len(), 3);
+        assert!(planned.iter().all(|(file_index, _)| *file_index == 0));
+    }
 }

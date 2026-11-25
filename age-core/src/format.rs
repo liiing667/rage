@@ -84,7 +84,7 @@ impl AgeStanza<'_> {
 /// recipient.
 ///
 /// This is the owned type; see [`AgeStanza`] for the reference type.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stanza {
     /// A tag identifying this stanza type.
     pub tag: String,

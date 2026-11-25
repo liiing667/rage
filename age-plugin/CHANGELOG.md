@@ -10,6 +10,13 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- `age_plugin::recipient::run_v1` validates the complete `wrap_file_keys` response
+  before sending any `recipient-stanza` frame. A plugin that returns only a prefix of the
+  requested file or recipient results now causes an internal error instead of publishing
+  partial stanzas. `age_plugin::identity::run_v1` similarly rejects results for file
+  indices that were not provided before publishing them.
+
 ### Changed
 - MSRV is now 1.85.0.
 

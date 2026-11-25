@@ -121,12 +121,17 @@ impl<R: Read, W: Write> Connection<R, W> {
     ) -> io::Result<()> {
         use cookie_factory::GenError;
 
-        cookie_factory::gen_simple(write::age_stanza(command, metadata, data), &mut self.output)
+        // Serialize the entire frame before writing any of it to the transport. If the
+        // frame cannot be rendered, or writing fails part-way through, we must not leave a
+        // potentially-valid prefix of a frame on the wire for the peer to interpret.
+        let mut frame = Vec::new();
+        cookie_factory::gen_simple(write::age_stanza(command, metadata, data), &mut frame)
             .map_err(|e| match e {
                 GenError::IoError(e) => e,
                 e => io::Error::other(format!("{e}")),
-            })
-            .and_then(|w| w.flush())
+            })?;
+        self.output.write_all(&frame)?;
+        self.output.flush()
     }
 
     fn send_stanza<S: AsRef<str>>(
@@ -151,10 +156,12 @@ impl<R: Read, W: Write> Connection<R, W> {
                 Ok((remainder, r)) => break (r.into(), self.buffer.len() - remainder.len()),
                 Err(nom::Err::Incomplete(_)) => {
                     if self.input.read_line(&mut self.buffer)? == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "incomplete response",
-                        ));
+                        let message = if self.buffer.is_empty() {
+                            "plugin response ended before a complete frame"
+                        } else {
+                            "plugin response ended in the middle of a frame"
+                        };
+                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, message));
                     };
                 }
                 Err(_) => {
@@ -227,11 +234,27 @@ impl<R: Read, W: Write> Connection<R, W> {
         let mut res_c = Ok(vec![]);
         let mut res_d = Ok(vec![]);
 
-        for stanza in iter::repeat_with(|| self.receive()).take_while(|res| match res {
-            Ok(stanza) => stanza.tag != COMMAND_DONE,
-            _ => true,
-        }) {
-            let stanza = stanza?;
+        loop {
+            let stanza = match self.receive() {
+                Ok(stanza) => stanza,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "plugin request ended before its terminal done frame",
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+
+            if stanza.tag == COMMAND_DONE {
+                if !stanza.args.is_empty() || !stanza.body.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "terminal done frame must not contain metadata or data",
+                    ));
+                }
+                break;
+            }
 
             fn validate<T, E>(
                 val: std::result::Result<T, E>,
@@ -293,15 +316,60 @@ impl<R: Read, W: Write> Connection<R, W> {
     }
 
     /// Runs a bidirectional phase as the recipient.
-    pub fn bidir_receive<H>(&mut self, commands: &[&str], mut handler: H) -> io::Result<()>
+    pub fn bidir_receive<H>(&mut self, commands: &[&str], handler: H) -> io::Result<()>
     where
         H: FnMut(Stanza, Reply<R, W>) -> Response,
     {
+        self.bidir_receive_transactional(commands, &[], handler)
+            .map(|_| ())
+    }
+
+    /// Runs a bidirectional phase as the recipient, staging result frames until the
+    /// terminal `done` frame has been received.
+    ///
+    /// `result_commands` names the commands whose frames are returned to the caller. The
+    /// handler is still invoked for every command (including result commands) so that
+    /// interactive plugins can make progress, but the staged frames are only returned
+    /// after a complete `done` frame has been validated. If the response ends early or the
+    /// terminal frame is malformed, an error is returned and the staged frames are
+    /// discarded.
+    pub fn bidir_receive_transactional<H>(
+        &mut self,
+        commands: &[&str],
+        result_commands: &[&str],
+        mut handler: H,
+    ) -> io::Result<Vec<Stanza>>
+    where
+        H: FnMut(Stanza, Reply<R, W>) -> Response,
+    {
+        let mut staged = Vec::new();
         loop {
-            let stanza = self.receive()?;
+            let stanza = match self.receive() {
+                Ok(stanza) => stanza,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "plugin response ended before its terminal done frame",
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             match stanza.tag.as_str() {
-                COMMAND_DONE => break Ok(()),
-                t if commands.contains(&t) => handler(stanza, Reply(self)).0?,
+                COMMAND_DONE => {
+                    if !stanza.args.is_empty() || !stanza.body.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "terminal done frame must not contain metadata or data",
+                        ));
+                    }
+                    break Ok(staged);
+                }
+                t if commands.contains(&t) => {
+                    if result_commands.contains(&t) {
+                        staged.push(stanza.clone());
+                    }
+                    handler(stanza, Reply(self)).0?;
+                }
                 _ => self.send::<&str>(RESPONSE_UNSUPPORTED, &[], &[])?,
             }
         }
@@ -518,6 +586,89 @@ mod tests {
                 None,
                 None,
             )
+        );
+    }
+
+    fn connection_with_input(input: &[u8]) -> Connection<std::io::Cursor<Vec<u8>>, PipeWriter> {
+        Connection {
+            input: BufReader::new(std::io::Cursor::new(input.to_vec())),
+            output: PipeWriter::new(Pipe::new()),
+            buffer: String::new(),
+            _working_dir: None,
+        }
+    }
+
+    #[test]
+    fn bidir_receive_rejects_reply_without_done_frame() {
+        let mut conn = connection_with_input(b"-> ok\n\n");
+        let mut handled = 0;
+
+        let err = conn
+            .bidir_receive_transactional(&[RESPONSE_OK], &[RESPONSE_OK], |_, reply| {
+                handled += 1;
+                reply.ok(None)
+            })
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("terminal done frame"),
+            "unexpected error: {err}"
+        );
+        // The handler can run before the terminator is known (so interactive plugins make
+        // progress), but the caller never receives the staged result.
+        assert_eq!(handled, 1);
+    }
+
+    #[test]
+    fn bidir_receive_rejects_malformed_done_frame() {
+        let mut conn = connection_with_input(b"-> done unexpected\n\n");
+
+        let err = conn
+            .bidir_receive(&[RESPONSE_OK], |_, reply| reply.ok(None))
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("terminal done frame"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bidir_receive_commits_after_done_frame() {
+        let mut conn = connection_with_input(b"-> ok\n\n-> done\n\n");
+        let mut handled = 0;
+
+        let staged = conn
+            .bidir_receive_transactional(&[RESPONSE_OK], &[RESPONSE_OK], |_, reply| {
+                handled += 1;
+                reply.ok(None)
+            })
+            .unwrap();
+
+        assert_eq!(handled, 1);
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].tag, RESPONSE_OK);
+    }
+
+    #[test]
+    fn unidir_receive_rejects_request_without_done_frame() {
+        let mut conn = connection_with_input(b"-> add-recipient test\n\n");
+
+        let err = conn
+            .unidir_receive::<(), (), (), (), _, _, _, _, _>(
+                ("add-recipient", |_| Ok::<(), ()>(())),
+                ("add-identity", |_| Ok::<(), ()>(())),
+                (None, |_| Ok::<(), ()>(())),
+                (None, |_| Ok::<(), ()>(())),
+            )
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("terminal done frame"),
+            "unexpected error: {err}"
         );
     }
 }
