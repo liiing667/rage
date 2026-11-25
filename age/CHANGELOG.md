@@ -10,6 +10,13 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- `age::cli_common::ReadError` and `age::IdentityFileConvertError` now redact
+  structured `AGE-SECRET-KEY-...` and `AGE-PLUGIN-...` values while formatting
+  their existing stable error variants. This prevents identity material passed
+  through filenames, recipients, or nested diagnostic strings from reaching
+  CLI stderr logs.
+
 ### Changed
 - MSRV is now 1.85.0.
 - Migrated to `chacha20poly1305 0.11`, `curve25519-dalek 5`, `hmac 0.13`,

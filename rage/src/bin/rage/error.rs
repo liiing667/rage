@@ -223,9 +223,76 @@ impl From<EncryptError> for Error {
     }
 }
 
-// Rust only supports `fn main() -> Result<(), E: Debug>`, so we implement `Debug`
-// manually to provide the error output we want.
-impl fmt::Debug for Error {
+impl Error {
+    /// Stable, non-user-facing identity of the diagnostic category.
+    ///
+    /// Redaction must preserve this code and the underlying enum variants so
+    /// callers and audits can still classify failures.
+    pub(crate) fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Error::Decryption(e) => e.diagnostic_code(),
+            Error::Encryption(e) => e.diagnostic_code(),
+            Error::IdentityFlagAmbiguous => "rage.identity_flag_ambiguous",
+            Error::MixedEncryptAndDecrypt => "rage.mixed_encrypt_and_decrypt",
+            Error::SameInputAndOutput(_) => "rage.same_input_and_output",
+        }
+    }
+
+    pub(crate) fn category(&self) -> &'static str {
+        match self {
+            Error::Decryption(_) => "decryption",
+            Error::Encryption(_) => "encryption",
+            Error::IdentityFlagAmbiguous => "arguments.identity_ambiguous",
+            Error::MixedEncryptAndDecrypt => "arguments.mixed_mode",
+            Error::SameInputAndOutput(_) => "io.same_input_output",
+        }
+    }
+}
+
+impl EncryptError {
+    pub(crate) fn diagnostic_code(&self) -> &'static str {
+        match self {
+            EncryptError::Age(_) => "rage.encrypt.age",
+            EncryptError::BrokenPipe { .. } => "rage.encrypt.broken_pipe",
+            EncryptError::IdentityRead(_) => "rage.encrypt.identity_read",
+            EncryptError::Io(_) => "rage.encrypt.io",
+            EncryptError::MixedIdentityAndPassphrase => "rage.encrypt.mixed_identity_passphrase",
+            EncryptError::MixedRecipientAndPassphrase => "rage.encrypt.mixed_recipient_passphrase",
+            EncryptError::MixedRecipientsFileAndPassphrase => {
+                "rage.encrypt.mixed_recipients_file_passphrase"
+            }
+            EncryptError::PassphraseTimedOut => "rage.encrypt.passphrase_timeout",
+            #[cfg(not(unix))]
+            EncryptError::PassphraseWithoutFileArgument => "rage.encrypt.passphrase_without_file",
+            EncryptError::PluginNameFlag => "rage.encrypt.plugin_name_flag",
+        }
+    }
+}
+
+impl DecryptError {
+    pub(crate) fn diagnostic_code(&self) -> &'static str {
+        match self {
+            DecryptError::Age(_) => "rage.decrypt.age",
+            DecryptError::ArmorFlag => "rage.decrypt.armor_flag",
+            DecryptError::IdentityRead(_) => "rage.decrypt.identity_read",
+            DecryptError::Io(_) => "rage.decrypt.io",
+            DecryptError::MissingIdentities { .. } => "rage.decrypt.missing_identities",
+            DecryptError::MixedIdentityAndPassphrase => "rage.decrypt.mixed_identity_passphrase",
+            DecryptError::MixedIdentityAndPluginName => "rage.decrypt.mixed_identity_plugin_name",
+            DecryptError::PassphraseFlag => "rage.decrypt.passphrase_flag",
+            DecryptError::PassphraseTimedOut => "rage.decrypt.passphrase_timeout",
+            #[cfg(not(unix))]
+            DecryptError::PassphraseWithoutFileArgument => "rage.decrypt.passphrase_without_file",
+            DecryptError::RecipientFlag => "rage.decrypt.recipient_flag",
+            DecryptError::RecipientsFileFlag => "rage.decrypt.recipients_file_flag",
+        }
+    }
+}
+
+// The diagnostic body is rendered as `Display`. Rust's `Termination` machinery
+// prints `Debug` for the error returned from `main`; that implementation is the
+// public stderr consumer and the single boundary where secrets are redacted.
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Decryption(e) => writeln!(f, "{e}")?,
@@ -244,5 +311,27 @@ impl fmt::Debug for Error {
             crate::fl!("err-ux-B"),
             crate::fl!("err-ux-C")
         )
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let diagnostic = format!("{self}");
+        f.write_str(&crate::redact::redact_globally(&diagnostic))
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Decryption(DecryptError::Age(e)) => Some(e),
+            Error::Decryption(DecryptError::IdentityRead(e)) => Some(e),
+            Error::Decryption(DecryptError::Io(e)) => Some(e),
+            Error::Encryption(EncryptError::Age(e)) => Some(e),
+            Error::Encryption(EncryptError::IdentityRead(e)) => Some(e),
+            Error::Encryption(EncryptError::Io(e)) => Some(e),
+            Error::Encryption(EncryptError::BrokenPipe { source, .. }) => Some(source),
+            _ => None,
+        }
     }
 }

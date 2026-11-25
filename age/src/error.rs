@@ -6,6 +6,70 @@ use std::io;
 
 use crate::{wfl, wlnfl};
 
+const AGE_SECRET_KEY_PREFIX: &str = "AGE-SECRET-KEY-";
+const AGE_PLUGIN_IDENTITY_PREFIX: &str = "AGE-PLUGIN-";
+const REDACTED_IDENTITY: &str = "[REDACTED_IDENTITY]";
+
+/// Removes structured identity material from a diagnostic string.
+///
+/// This is intentionally syntax-directed: ordinary filenames and recipient
+/// strings are preserved, while values that look like age secret keys or plugin
+/// identities are replaced with a stable marker. Callers that know an arbitrary
+/// passphrase should additionally use an exact-value redactor at their public
+/// error boundary.
+pub(crate) fn redact_diagnostic_secrets(input: &str) -> String {
+    fn starts_with_ci_at(text: &str, offset: usize, prefix: &str) -> bool {
+        text.as_bytes()
+            .get(offset..offset + prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+    }
+
+    fn terminates_secret(ch: char) -> bool {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '\'' | '"' | '`' | ',' | ';' | ')' | ']' | '}' | '<' | '>'
+            )
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+
+    while index < input.len() {
+        let prefix = if starts_with_ci_at(input, index, AGE_SECRET_KEY_PREFIX) {
+            Some(AGE_SECRET_KEY_PREFIX)
+        } else if starts_with_ci_at(input, index, AGE_PLUGIN_IDENTITY_PREFIX) {
+            Some(AGE_PLUGIN_IDENTITY_PREFIX)
+        } else {
+            None
+        };
+
+        if let Some(prefix) = prefix {
+            let data_start = index + prefix.len();
+            let mut end = data_start;
+            while end < input.len() {
+                let ch = input[end..].chars().next().unwrap();
+                if terminates_secret(ch) {
+                    break;
+                }
+                end += ch.len_utf8();
+            }
+
+            if end > data_start {
+                output.push_str(REDACTED_IDENTITY);
+                index = end;
+                continue;
+            }
+        }
+
+        let ch = input[index..].chars().next().unwrap();
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+
+    output
+}
+
 #[cfg(feature = "plugin")]
 use age_core::format::Stanza;
 
@@ -41,17 +105,22 @@ impl fmt::Display for IdentityFileConvertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IdentityFileConvertError::FailedToWriteOutput(e) => {
-                wfl!(f, "err-failed-to-write-output", err = e.to_string())
+                let err = redact_diagnostic_secrets(&e.to_string());
+                wfl!(f, "err-failed-to-write-output", err = err)
             }
             #[cfg(feature = "plugin")]
             IdentityFileConvertError::IdentityFileContainsPlugin {
                 filename,
                 plugin_name,
             } => {
+                let filename = filename
+                    .as_deref()
+                    .map(redact_diagnostic_secrets)
+                    .unwrap_or_default();
                 wlnfl!(
                     f,
                     "err-identity-file-contains-plugin",
-                    filename = filename.as_deref().unwrap_or_default(),
+                    filename = filename.as_str(),
                     plugin_name = plugin_name.as_str(),
                 )?;
                 wfl!(
@@ -60,12 +129,15 @@ impl fmt::Display for IdentityFileConvertError {
                     plugin_name = plugin_name.as_str(),
                 )
             }
-            IdentityFileConvertError::NoIdentities { filename } => match filename {
-                Some(filename) => {
-                    wfl!(f, "err-no-identities-in-file", filename = filename.as_str())
+            IdentityFileConvertError::NoIdentities { filename } => {
+                let filename = filename.as_deref().map(redact_diagnostic_secrets);
+                match filename.as_deref() {
+                    Some(filename) => {
+                        wfl!(f, "err-no-identities-in-file", filename = filename)
+                    }
+                    None => wfl!(f, "err-no-identities-in-stdin"),
                 }
-                None => wfl!(f, "err-no-identities-in-stdin"),
-            },
+            }
         }
     }
 }

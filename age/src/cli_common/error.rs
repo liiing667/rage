@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io;
 
+use crate::error::redact_diagnostic_secrets;
 use crate::{DecryptError, wfl};
 
 /// Errors that can occur while reading recipients or identities.
@@ -56,42 +57,59 @@ impl From<io::Error> for ReadError {
 impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReadError::EncryptedIdentities(e) => e.fmt(f),
+            ReadError::EncryptedIdentities(e) => {
+                write!(f, "{}", redact_diagnostic_secrets(&e.to_string()))
+            }
             ReadError::IdentityEncryptedWithoutPassphrase(filename) => {
+                let filename = redact_diagnostic_secrets(filename);
                 wfl!(
                     f,
                     "err-read-identity-encrypted-without-passphrase",
                     filename = filename.as_str(),
                 )
             }
-            ReadError::IdentityNotFound(filename) => wfl!(
-                f,
-                "err-read-identity-not-found",
-                filename = filename.as_str(),
-            ),
-            ReadError::InvalidRecipient(recipient) => wfl!(
-                f,
-                "err-read-invalid-recipient",
-                recipient = recipient.as_str(),
-            ),
+            ReadError::IdentityNotFound(filename) => {
+                let filename = redact_diagnostic_secrets(filename);
+                wfl!(
+                    f,
+                    "err-read-identity-not-found",
+                    filename = filename.as_str(),
+                )
+            }
+            ReadError::InvalidRecipient(recipient) => {
+                let recipient = redact_diagnostic_secrets(recipient);
+                wfl!(
+                    f,
+                    "err-read-invalid-recipient",
+                    recipient = recipient.as_str(),
+                )
+            }
             ReadError::InvalidRecipientsFile {
                 filename,
                 line_number,
-            } => wfl!(
-                f,
-                "err-read-invalid-recipients-file",
-                filename = filename.as_str(),
-                line_number = line_number,
-            ),
-            ReadError::Io(e) => write!(f, "{e}"),
-            ReadError::MissingRecipientsFile(filename) => wfl!(
-                f,
-                "err-read-missing-recipients-file",
-                filename = filename.as_str(),
-            ),
+            } => {
+                let filename = redact_diagnostic_secrets(filename);
+                wfl!(
+                    f,
+                    "err-read-invalid-recipients-file",
+                    filename = filename.as_str(),
+                    line_number = line_number,
+                )
+            }
+            ReadError::Io(e) => write!(f, "{}", redact_diagnostic_secrets(&e.to_string())),
+            ReadError::MissingRecipientsFile(filename) => {
+                let filename = redact_diagnostic_secrets(filename);
+                wfl!(
+                    f,
+                    "err-read-missing-recipients-file",
+                    filename = filename.as_str(),
+                )
+            }
             ReadError::MultipleStdin => wfl!(f, "err-read-multiple-stdin"),
             #[cfg(feature = "plugin")]
-            ReadError::PluginResolve(e) => write!(f, "{e}"),
+            ReadError::PluginResolve(e) => {
+                write!(f, "{}", redact_diagnostic_secrets(&e.to_string()))
+            }
             #[cfg(feature = "ssh")]
             ReadError::RsaModulusTooLarge => {
                 wfl!(f, "err-read-rsa-modulus-too-large", max_size = 4096)
@@ -101,7 +119,10 @@ impl fmt::Display for ReadError {
                 wfl!(f, "err-read-rsa-modulus-too-small")
             }
             #[cfg(feature = "ssh")]
-            ReadError::UnsupportedKey(filename, k) => k.display(f, Some(filename.as_str())),
+            ReadError::UnsupportedKey(filename, k) => {
+                let filename = redact_diagnostic_secrets(filename);
+                k.display(f, Some(filename.as_str()))
+            }
         }
     }
 }

@@ -12,6 +12,13 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- `rage`'s public stderr error consumer now masks structured identity values
+  and passphrase values mistakenly supplied to `--passphrase=...`, while
+  preserving stable error variants/codes, usage, and helpful hints. Secret
+  diagnostic events additionally write a local `security-receipt.json` audit
+  record without storing the secret.
+
 ### Changed
 - MSRV is now 1.85.0.
 - MSRV for `rage-mount` (behind the `mount` feature flag) is now 1.88.0.
