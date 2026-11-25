@@ -20,7 +20,7 @@ use nom::{
 };
 use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use rsa::{Oaep, traits::PublicKeyParts};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
 use super::{
@@ -113,6 +113,91 @@ impl fmt::Display for Recipient {
     }
 }
 
+impl Recipient {
+    /// Returns the SSH key-type prefix for this recipient.
+    #[must_use]
+    pub fn key_algorithm(&self) -> &'static str {
+        match self {
+            Recipient::SshRsa(..) => SSH_RSA_KEY_PREFIX,
+            Recipient::SshEd25519(..) => SSH_ED25519_KEY_PREFIX,
+        }
+    }
+
+    /// Returns the canonical SSH wire encoding of the public key.
+    ///
+    /// This is the only value used to derive the age recipient tag and SSH
+    /// fingerprint. Comments, terminal control sequences, and other trailing
+    /// text in a public-key line are not part of this byte string.
+    #[must_use]
+    pub fn canonical_key_blob(&self) -> &[u8] {
+        match self {
+            Recipient::SshRsa(ssh_key, _) | Recipient::SshEd25519(ssh_key, _) => ssh_key,
+        }
+    }
+
+    /// Returns the raw SHA-256 digest of [`Self::canonical_key_blob`].
+    #[must_use]
+    pub fn sha256_fingerprint(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_key_blob()).into()
+    }
+
+    /// Returns the conventional base64 SSH SHA-256 fingerprint, for example
+    /// `SHA256:...`.
+    #[must_use]
+    pub fn sha256_fingerprint_string(&self) -> String {
+        format!(
+            "SHA256:{}",
+            BASE64_STANDARD_NO_PAD.encode(self.sha256_fingerprint())
+        )
+    }
+
+    /// Returns the conventional `SHA256:` SSH fingerprint.
+    ///
+    /// This is an alias for [`Self::sha256_fingerprint_string`]. The value is
+    /// computed only from [`Self::canonical_key_blob`].
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        self.sha256_fingerprint_string()
+    }
+
+    pub(crate) fn recipient_tag(&self) -> [u8; 4] {
+        ssh_tag(self.canonical_key_blob())
+    }
+
+    fn rsa(pk: rsa::RsaPublicKey) -> Self {
+        let mut ssh_key = Vec::new();
+        cookie_factory::r#gen(super::write_ssh::rsa_pubkey(&pk), &mut ssh_key)
+            .expect("serializing to a Vec cannot fail");
+        Recipient::SshRsa(ssh_key, pk)
+    }
+
+    fn ed25519(pk: EdwardsPoint) -> Self {
+        fn ssh_string(bytes: &[u8]) -> Vec<u8> {
+            let mut encoded = Vec::with_capacity(4 + bytes.len());
+            encoded.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(bytes);
+            encoded
+        }
+
+        let encoded_point = pk.compress().to_bytes();
+        let mut ssh_key = ssh_string(SSH_ED25519_KEY_PREFIX.as_bytes());
+        ssh_key.extend_from_slice(&ssh_string(&encoded_point));
+        Recipient::SshEd25519(ssh_key, pk)
+    }
+}
+
+impl PartialEq for Recipient {
+    /// Compares recipients by their canonical public-key body.
+    ///
+    /// Two textual recipient lines with different comments or control
+    /// characters are equal when their canonical keys are equal.
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_key_blob() == other.canonical_key_blob()
+    }
+}
+
+impl Eq for Recipient {}
+
 impl TryFrom<Identity> for Recipient {
     type Error = ParseRecipientKeyError;
 
@@ -124,14 +209,14 @@ impl TryFrom<Identity> for Recipient {
                 match read_ssh::rsa_pubkey(rsa::RsaPublicKey::MAX_SIZE)(&ssh_key) {
                     Ok((_, pk)) => {
                         if let Some(pk) = pk {
-                            Ok(Recipient::SshRsa(ssh_key, pk))
+                            Ok(Recipient::rsa(pk))
                         } else {
                             Err(ParseRecipientKeyError::RsaModulusTooLarge)
                         }
                     }
                     _ => {
                         if let Ok((_, pk)) = read_ssh::ed25519_pubkey(&ssh_key) {
-                            Ok(Recipient::SshEd25519(ssh_key, pk))
+                            Ok(Recipient::ed25519(pk))
                         } else if let Ok((_, key_type)) = read_ssh::string(&ssh_key) {
                             Err(ParseRecipientKeyError::Unsupported(
                                 String::from_utf8_lossy(key_type).to_string(),
@@ -160,7 +245,7 @@ impl crate::Recipient for Recipient {
         let mut rng = UnwrapErr(SysRng);
 
         let stanzas = match self {
-            Recipient::SshRsa(ssh_key, pk) => {
+            Recipient::SshRsa(_, pk) => {
                 let encrypted_file_key = pk
                     .encrypt(
                         &mut rng,
@@ -169,7 +254,7 @@ impl crate::Recipient for Recipient {
                     )
                     .expect("pubkey is valid and file key is not too long");
 
-                let encoded_tag = BASE64_STANDARD_NO_PAD.encode(ssh_tag(ssh_key));
+                let encoded_tag = BASE64_STANDARD_NO_PAD.encode(self.recipient_tag());
 
                 vec![Stanza {
                     tag: SSH_RSA_RECIPIENT_TAG.to_owned(),
@@ -199,7 +284,7 @@ impl crate::Recipient for Recipient {
                 );
                 let encrypted_file_key = aead_encrypt(&enc_key, file_key.expose_secret());
 
-                let encoded_tag = BASE64_STANDARD_NO_PAD.encode(ssh_tag(ssh_key));
+                let encoded_tag = BASE64_STANDARD_NO_PAD.encode(self.recipient_tag());
                 let encoded_epk = BASE64_STANDARD_NO_PAD.encode(epk.as_bytes());
 
                 vec![Stanza {
@@ -224,7 +309,7 @@ fn ssh_rsa_pubkey(max_size: usize) -> impl Fn(&str) -> IResult<&str, ParsedRecip
                     Ok((_, Some(pk))) => Some(if pk.n().bits() < 2048 {
                         ParsedRecipient::RsaModulusTooSmall
                     } else {
-                        ParsedRecipient::Supported(Recipient::SshRsa(ssh_key, pk))
+                        ParsedRecipient::Supported(Recipient::rsa(pk))
                     }),
                     Ok((_, None)) => Some(ParsedRecipient::RsaModulusTooLarge),
                     Err(_) => None,
@@ -241,9 +326,7 @@ fn ssh_ed25519_pubkey(input: &str) -> IResult<&str, ParsedRecipient> {
         map_opt(
             encoded_str(51, BASE64_STANDARD_NO_PAD),
             |ssh_key| match read_ssh::ed25519_pubkey(&ssh_key) {
-                Ok((_, pk)) => Some(ParsedRecipient::Supported(Recipient::SshEd25519(
-                    ssh_key, pk,
-                ))),
+                Ok((_, pk)) => Some(ParsedRecipient::Supported(Recipient::ed25519(pk))),
                 Err(_) => None,
             },
         ),
@@ -317,5 +400,39 @@ pub(crate) mod tests {
             pk.unwrap_err(),
             ParseRecipientKeyError::Invalid("invalid SSH recipient")
         );
+    }
+
+    #[test]
+    fn comments_and_control_characters_do_not_change_identity() {
+        for public_key in [TEST_SSH_RSA_PK, TEST_SSH_ED25519_PK] {
+            let trusted: Recipient = public_key.parse().unwrap();
+            let canonical_line = trusted.to_string();
+
+            let variants = [
+                format!("{canonical_line} attacker@example"),
+                format!("{canonical_line}\toperator-comment"),
+                format!("{canonical_line} comment with \u{0000} NUL"),
+                format!("{canonical_line} \u{001b}[2J forged terminal output"),
+                format!("{canonical_line}\u{0007}\r\n"),
+            ];
+
+            for variant in variants {
+                let parsed: Recipient = variant.parse().unwrap();
+                assert_eq!(parsed, trusted);
+                assert_eq!(
+                    parsed.canonical_key_blob(),
+                    trusted.canonical_key_blob(),
+                    "comment/control bytes changed canonical key body"
+                );
+                assert_eq!(
+                    parsed.sha256_fingerprint(),
+                    trusted.sha256_fingerprint(),
+                    "comment/control bytes changed fingerprint"
+                );
+                assert_eq!(parsed.recipient_tag(), trusted.recipient_tag());
+                assert!(parsed.sha256_fingerprint_string().starts_with("SHA256:"));
+                assert_eq!(parsed.to_string(), canonical_line);
+            }
+        }
     }
 }

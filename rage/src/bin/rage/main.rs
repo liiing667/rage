@@ -22,6 +22,8 @@ use cli::AgeOptions;
 mod error;
 
 mod i18n;
+#[cfg(feature = "ssh")]
+mod security_record;
 
 #[macro_export]
 macro_rules! fl {
@@ -375,11 +377,23 @@ fn main() -> Result<(), error::Error> {
 
     let opts = AgeOptions::parse();
 
+    #[cfg(feature = "ssh")]
+    let ssh_audit_inputs = security_record::SshAuditInputs {
+        recipient_strings: opts.recipient.clone(),
+        recipient_files: opts.recipients_file.clone(),
+    };
+
     if opts.encrypt && opts.decrypt {
-        return Err(error::Error::MixedEncryptAndDecrypt);
+        let result = Err(error::Error::MixedEncryptAndDecrypt);
+        #[cfg(feature = "ssh")]
+        security_record::record_ssh_recipient_audit(&ssh_audit_inputs, result.is_ok());
+        return result;
     }
     if !(opts.identity.is_empty() || opts.encrypt || opts.decrypt) {
-        return Err(error::Error::IdentityFlagAmbiguous);
+        let result = Err(error::Error::IdentityFlagAmbiguous);
+        #[cfg(feature = "ssh")]
+        security_record::record_ssh_recipient_audit(&ssh_audit_inputs, result.is_ok());
+        return result;
     }
 
     if let (Some(in_file), Some(out_file)) = (&opts.input, &opts.output) {
@@ -388,15 +402,23 @@ fn main() -> Result<(), error::Error> {
         let out_path = Path::new(&out_file);
         match (in_path.canonicalize(), out_path.canonicalize()) {
             (Ok(in_abs), Ok(out_abs)) if in_abs == out_abs => {
-                return Err(error::Error::SameInputAndOutput(out_file.clone()));
+                let result = Err(error::Error::SameInputAndOutput(out_file.clone()));
+                #[cfg(feature = "ssh")]
+                security_record::record_ssh_recipient_audit(&ssh_audit_inputs, result.is_ok());
+                return result;
             }
             _ => (),
         }
     }
 
-    if opts.decrypt {
+    let result = if opts.decrypt {
         decrypt(opts).map_err(error::Error::from)
     } else {
         encrypt(opts).map_err(error::Error::from)
-    }
+    };
+
+    #[cfg(feature = "ssh")]
+    security_record::record_ssh_recipient_audit(&ssh_audit_inputs, result.is_ok());
+
+    result
 }

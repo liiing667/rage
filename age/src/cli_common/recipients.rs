@@ -136,6 +136,12 @@ fn read_recipients_list<R: io::BufRead>(
 
 /// Reads recipients from the provided arguments.
 ///
+/// This is an all-or-nothing recipient transaction: if any argument or source
+/// line is invalid, an error is returned and no partial recipient set is
+/// published. SSH recipient identities and fingerprints are derived by
+/// `age::ssh::Recipient` solely from the canonical SSH key body; comments and
+/// control bytes in trailing text do not affect identity.
+///
 /// `recipients_file_strings` and `identity_strings` may collectively contain at most one
 /// entry of `"-"`, which will be interpreted as reading from standard input. An error
 /// will be returned if `stdin_guard` is guarding an existing usage of standard input.
