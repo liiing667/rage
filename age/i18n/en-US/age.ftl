@@ -46,6 +46,8 @@ rec-deny-binary-output = Did you mean to use {-flag-armor}? {rec-detected-binary
 
 err-deny-overwrite-file = refusing to overwrite existing file '{$filename}'.
 
+err-incomplete-output = refusing to consume incomplete output '{$filename}'; no complete generation was published under this name.
+
 err-invalid-filename = invalid filename '{$filename}'.
 
 err-missing-directory = directory '{$path}' does not exist.

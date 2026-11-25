@@ -10,6 +10,15 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- `age::cli_common::file_io::OutputWriter` now stages regular-file output in a
+  hidden spool and publishes it atomically with `OutputWriter::finish`. Dropping
+  the writer before `finish` discards the spool and leaves the previous complete
+  generation untouched. Callers must invoke `finish` to publish file output.
+- `age::cli_common::file_io::{InputReader, OutputWriter}` now reject unfinished
+  spool files, so an interrupted output transaction cannot be reopened as a
+  complete product. Standard output remains a direct stream.
+
 ### Changed
 - MSRV is now 1.85.0.
 - Migrated to `chacha20poly1305 0.11`, `curve25519-dalek 5`, `hmac 0.13`,

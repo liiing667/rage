@@ -12,6 +12,14 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- File output from `rage` is now staged in a hidden spool and atomically
+  published only after the encryption/decryption operation completes. An
+  interrupted run no longer replaces the destination with a partial generation,
+  and unfinished spool files are rejected by the public file consumers.
+- `rage` now writes `security-receipt.json` and `security-receipt.jsonl` with a
+  reviewable record of output generation publication and rejection.
+
 ### Changed
 - MSRV is now 1.85.0.
 - MSRV for `rage-mount` (behind the `mount` feature flag) is now 1.88.0.

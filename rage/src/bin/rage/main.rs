@@ -22,6 +22,7 @@ use cli::AgeOptions;
 mod error;
 
 mod i18n;
+mod security_record;
 
 #[macro_export]
 macro_rules! fl {
@@ -97,7 +98,10 @@ impl<R: io::Read, const N: usize> io::Read for ReadChecker<R, N> {
     }
 }
 
-fn encrypt(opts: AgeOptions) -> Result<(), error::EncryptError> {
+fn encrypt(
+    opts: AgeOptions,
+    audit: &mut security_record::OperationAudit,
+) -> Result<(), error::EncryptError> {
     if opts.plugin_name.is_some() {
         return Err(error::EncryptError::PluginNameFlag);
     }
@@ -112,6 +116,7 @@ fn encrypt(opts: AgeOptions) -> Result<(), error::EncryptError> {
     let has_file_argument = opts.input.is_some();
 
     let (input, output) = set_up_io(opts.input, opts.output, output_format)?;
+    audit.observe_output(&output);
 
     let is_stdin = match input {
         file_io::InputReader::File(_) => false,
@@ -203,7 +208,7 @@ fn encrypt(opts: AgeOptions) -> Result<(), error::EncryptError> {
         Ok(())
     });
 
-    io::copy(
+    let copied = io::copy(
         &mut ReadChecker::new(
             input,
             [
@@ -214,24 +219,40 @@ fn encrypt(opts: AgeOptions) -> Result<(), error::EncryptError> {
         &mut output,
     )
     .map_err(map_io_errors)?;
-    output
+    audit.mark_written(copied);
+
+    let output = output
         .finish()
         .and_then(|armor| armor.finish())
         .map_err(map_io_errors)?;
+    output.finish().map_err(map_io_errors)?;
+    audit.mark_published();
 
     Ok(())
 }
 
-fn write_output<R: io::Read, W: io::Write>(
+fn write_output<R: io::Read>(
     mut input: R,
-    mut output: W,
+    output: file_io::OutputWriter,
+    audit: &mut security_record::OperationAudit,
 ) -> Result<(), error::DecryptError> {
-    io::copy(&mut input, &mut output)?;
+    let mut output = output;
+    audit.observe_output(&output);
+    let copied = io::copy(&mut input, &mut output)?;
+    audit.mark_written(copied);
+
+    // `io::copy` only returns after the STREAM reader has accepted the final
+    // authenticated chunk. Publishing the spool is therefore the completion boundary.
+    output.finish()?;
+    audit.mark_published();
 
     Ok(())
 }
 
-fn decrypt(opts: AgeOptions) -> Result<(), error::DecryptError> {
+fn decrypt(
+    opts: AgeOptions,
+    audit: &mut security_record::OperationAudit,
+) -> Result<(), error::DecryptError> {
     if opts.armor {
         return Err(error::DecryptError::ArmorFlag);
     }
@@ -254,6 +275,7 @@ fn decrypt(opts: AgeOptions) -> Result<(), error::DecryptError> {
     let has_file_argument = opts.input.is_some();
 
     let (input, output) = set_up_io(opts.input, opts.output, file_io::OutputFormat::Unknown)?;
+    audit.observe_output(&output);
 
     let is_stdin = match input {
         file_io::InputReader::File(_) => false,
@@ -322,7 +344,7 @@ fn decrypt(opts: AgeOptions) -> Result<(), error::DecryptError> {
                 decryptor
                     .decrypt(Some(&identity as _).into_iter())
                     .map_err(|e| e.into())
-                    .and_then(|input| write_output(input, output))
+                    .and_then(|input| write_output(input, output, audit))
             }
             Err(pinentry::Error::Cancelled) => Ok(()),
             Err(pinentry::Error::Timeout) => Err(error::DecryptError::PassphraseTimedOut),
@@ -347,7 +369,34 @@ fn decrypt(opts: AgeOptions) -> Result<(), error::DecryptError> {
         decryptor
             .decrypt(identities.iter().map(|i| i.as_ref() as &dyn Identity))
             .map_err(|e| e.into())
-            .and_then(|input| write_output(input, output))
+            .and_then(|input| write_output(input, output, audit))
+    }
+}
+
+fn run(opts: AgeOptions, audit: &mut security_record::OperationAudit) -> Result<(), error::Error> {
+    if opts.encrypt && opts.decrypt {
+        return Err(error::Error::MixedEncryptAndDecrypt);
+    }
+    if !(opts.identity.is_empty() || opts.encrypt || opts.decrypt) {
+        return Err(error::Error::IdentityFlagAmbiguous);
+    }
+
+    if let (Some(in_file), Some(out_file)) = (&opts.input, &opts.output) {
+        // Check that the given filenames do not correspond to the same file.
+        let in_path = Path::new(&in_file);
+        let out_path = Path::new(&out_file);
+        match (in_path.canonicalize(), out_path.canonicalize()) {
+            (Ok(in_abs), Ok(out_abs)) if in_abs == out_abs => {
+                return Err(error::Error::SameInputAndOutput(out_file.clone()));
+            }
+            _ => (),
+        }
+    }
+
+    if opts.decrypt {
+        decrypt(opts, audit).map_err(error::Error::from)
+    } else {
+        encrypt(opts, audit).map_err(error::Error::from)
     }
 }
 
@@ -375,28 +424,22 @@ fn main() -> Result<(), error::Error> {
 
     let opts = AgeOptions::parse();
 
-    if opts.encrypt && opts.decrypt {
-        return Err(error::Error::MixedEncryptAndDecrypt);
+    // Create the audit before any output is opened so `reopened` and the previous
+    // generation identity describe the state the user actually asked to replace.
+    let operation = if opts.decrypt { "decrypt" } else { "encrypt" };
+    let mut audit =
+        security_record::OperationAudit::new(operation, opts.input.clone(), opts.output.clone());
+    let result = run(opts, &mut audit);
+    // A receipt is most valuable when there is a previous generation to protect or an
+    // encrypt/decrypt rejection to explain. Avoid dropping audit files into a directory
+    // whose consumer only expects the freshly created output.
+    let should_record = audit.reopened()
+        || matches!(
+            &result,
+            Err(error::Error::Encryption(_) | error::Error::Decryption(_))
+        );
+    if should_record {
+        security_record::write_receipt(&audit, &result);
     }
-    if !(opts.identity.is_empty() || opts.encrypt || opts.decrypt) {
-        return Err(error::Error::IdentityFlagAmbiguous);
-    }
-
-    if let (Some(in_file), Some(out_file)) = (&opts.input, &opts.output) {
-        // Check that the given filenames do not correspond to the same file.
-        let in_path = Path::new(&in_file);
-        let out_path = Path::new(&out_file);
-        match (in_path.canonicalize(), out_path.canonicalize()) {
-            (Ok(in_abs), Ok(out_abs)) if in_abs == out_abs => {
-                return Err(error::Error::SameInputAndOutput(out_file.clone()));
-            }
-            _ => (),
-        }
-    }
-
-    if opts.decrypt {
-        decrypt(opts).map_err(error::Error::from)
-    } else {
-        encrypt(opts).map_err(error::Error::from)
-    }
+    result
 }

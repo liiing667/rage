@@ -70,17 +70,23 @@ fn generate(mut output: file_io::OutputWriter) -> io::Result<()> {
         eprintln!("{}: {}", fl!("tty-pubkey"), pk);
     }
 
+    output.finish()?;
+
     Ok(())
 }
 
-fn convert(filename: Option<String>, output: file_io::OutputWriter) -> Result<(), error::Error> {
+fn convert(
+    filename: Option<String>,
+    mut output: file_io::OutputWriter,
+) -> Result<(), error::Error> {
     let file = age::IdentityFile::from_input_reader(
         file_io::InputReader::new(filename).map_err(error::Error::FailedToOpenInput)?,
     )
     .map_err(error::Error::FailedToReadInput)?;
 
-    file.write_recipients_file(output)
+    file.write_recipients_file(&mut output)
         .map_err(error::Error::IdentityFileConvert)?;
+    output.finish().map_err(error::Error::FailedToWriteOutput)?;
 
     Ok(())
 }
