@@ -104,4 +104,19 @@ mod tests {
         let decrypted = decrypt(&sk, encrypted.as_bytes()).unwrap();
         assert_eq!(&decrypted[..], &test_msg[..]);
     }
+
+    #[test]
+    fn failed_authentication_does_not_publish_plaintext() {
+        let sk = x25519::Identity::generate();
+        let pk = sk.to_public();
+
+        // Use several STREAM chunks so this covers a visible prefix, not just an empty file.
+        let plaintext = vec![0x61; 200_000];
+        let mut ciphertext = encrypt(&pk, &plaintext).unwrap();
+        *ciphertext.last_mut().unwrap() ^= 1;
+
+        // The public API returns either a complete Vec or an error; there is no partial
+        // output value to publish when authentication fails.
+        assert!(decrypt(&sk, &ciphertext).is_err());
+    }
 }

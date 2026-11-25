@@ -225,13 +225,14 @@ fn encrypt(opts: AgeOptions) -> Result<(), error::EncryptError> {
 fn write_output<R: io::Read, W: io::Write>(
     mut input: R,
     mut output: W,
-) -> Result<(), error::DecryptError> {
-    io::copy(&mut input, &mut output)?;
-
-    Ok(())
+) -> Result<u64, error::DecryptError> {
+    Ok(io::copy(&mut input, &mut output)?)
 }
 
-fn decrypt(opts: AgeOptions) -> Result<(), error::DecryptError> {
+fn decrypt(
+    opts: AgeOptions,
+    audit: &mut security_record::DecryptAudit,
+) -> Result<(), error::DecryptError> {
     if opts.armor {
         return Err(error::DecryptError::ArmorFlag);
     }
@@ -253,7 +254,12 @@ fn decrypt(opts: AgeOptions) -> Result<(), error::DecryptError> {
     #[cfg(not(unix))]
     let has_file_argument = opts.input.is_some();
 
-    let (input, output) = set_up_io(opts.input, opts.output, file_io::OutputFormat::Unknown)?;
+    let output_path = opts.output.clone();
+    let (input, mut output) = set_up_io(
+        opts.input.clone(),
+        opts.output.clone(),
+        file_io::OutputFormat::Unknown,
+    )?;
 
     let is_stdin = match input {
         file_io::InputReader::File(_) => false,
@@ -319,10 +325,10 @@ fn decrypt(opts: AgeOptions) -> Result<(), error::DecryptError> {
                     identity.set_max_work_factor(max_work_factor);
                 }
 
-                decryptor
+                let mut input = decryptor
                     .decrypt(Some(&identity as _).into_iter())
-                    .map_err(|e| e.into())
-                    .and_then(|input| write_output(input, output))
+                    .map_err(error::DecryptError::from)?;
+                publish_decrypted(&mut input, &mut output, output_path.as_deref(), audit)
             }
             Err(pinentry::Error::Cancelled) => Ok(()),
             Err(pinentry::Error::Timeout) => Err(error::DecryptError::PassphraseTimedOut),
@@ -344,11 +350,72 @@ fn decrypt(opts: AgeOptions) -> Result<(), error::DecryptError> {
             return Err(error::DecryptError::MissingIdentities { stdin_identity });
         }
 
-        decryptor
+        let mut input = decryptor
             .decrypt(identities.iter().map(|i| i.as_ref() as &dyn Identity))
-            .map_err(|e| e.into())
-            .and_then(|input| write_output(input, output))
+            .map_err(error::DecryptError::from)?;
+        publish_decrypted(&mut input, &mut output, output_path.as_deref(), audit)
     }
+}
+
+fn publish_decrypted<R: io::Read>(
+    input: &mut R,
+    stdout: &mut file_io::OutputWriter,
+    output_path: Option<&str>,
+    audit: &mut security_record::DecryptAudit,
+) -> Result<(), error::DecryptError> {
+    let file_output = match output_path {
+        None | Some("-") => None,
+        Some(path) => Some(path),
+    };
+
+    let Some(path) = file_output else {
+        // Withhold even stdout until the complete STREAM has authenticated. The spool is
+        // disk-backed, so large legal files do not need to fit in memory.
+        let mut spool = file_io::TemporarySpool::new()?;
+        let copied = match write_output(input, &mut spool) {
+            Ok(copied) => copied,
+            Err(error) => {
+                drop(spool);
+                return Err(error);
+            }
+        };
+        audit.record_copy(copied);
+        audit.mark_authenticated();
+        spool.publish_to(&mut *stdout)?;
+        audit.mark_published();
+        return Ok(());
+    };
+
+    audit.record_target_before(path);
+    let mut spool = match file_io::AtomicFile::create(path, 0o666) {
+        Ok(spool) => spool,
+        Err(error) => {
+            audit.mark_failed_before_commit();
+            return Err(error.into());
+        }
+    };
+    audit.record_spool(&spool.temporary().display().to_string());
+
+    let copied = match write_output(input, &mut spool) {
+        Ok(copied) => copied,
+        Err(error) => {
+            spool.abort();
+            audit.mark_failed_before_commit();
+            return Err(error);
+        }
+    };
+    audit.record_copy(copied);
+
+    // `io::copy` only reports EOF after the STREAM reader has accepted its final
+    // authenticated chunk. Commit is therefore the publication boundary.
+    audit.mark_authenticated();
+    if let Err(error) = spool.finish() {
+        audit.mark_failed_before_commit();
+        return Err(error.into());
+    }
+
+    audit.mark_published();
+    Ok(())
 }
 
 fn main() -> Result<(), error::Error> {
@@ -395,8 +462,361 @@ fn main() -> Result<(), error::Error> {
     }
 
     if opts.decrypt {
-        decrypt(opts).map_err(error::Error::from)
+        let audit_input = opts.input.clone();
+        let audit_output = opts.output.clone();
+        let mut audit = security_record::DecryptAudit::new(audit_input, audit_output);
+        let result = decrypt(opts, &mut audit);
+        security_record::write_decrypt_receipt(&audit, &result);
+        result.map_err(error::Error::from)
     } else {
         encrypt(opts).map_err(error::Error::from)
+    }
+}
+
+mod security_record {
+    //! Durable security receipts for decryption output publication.
+
+    use std::fmt::Write as FmtWrite;
+    use std::fs;
+    use std::io::Write as IoWrite;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::error::DecryptError;
+
+    /// Mutable evidence collected while a decryption operation is running.
+    #[derive(Debug, Clone)]
+    pub(crate) struct DecryptAudit {
+        input: Option<String>,
+        output: Option<String>,
+        generation: String,
+        target_before: Option<String>,
+        target_after: Option<String>,
+        spool: Option<String>,
+        spool_size: Option<u64>,
+        bytes_copied: Option<u64>,
+        authentication_complete: bool,
+        published: bool,
+        old_file_preserved: Option<bool>,
+        old_file_replaced: Option<bool>,
+    }
+
+    impl DecryptAudit {
+        pub(crate) fn new(input: Option<String>, output: Option<String>) -> Self {
+            static GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let generation = format!(
+                "{}-{nanos}-{}",
+                std::process::id(),
+                GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+
+            Self {
+                input,
+                output,
+                generation,
+                target_before: None,
+                target_after: None,
+                spool: None,
+                spool_size: None,
+                bytes_copied: None,
+                authentication_complete: false,
+                published: false,
+                old_file_preserved: None,
+                old_file_replaced: None,
+            }
+        }
+
+        pub(crate) fn record_target_before(&mut self, path: &str) {
+            self.target_before = Some(object_identity(path));
+        }
+
+        pub(crate) fn record_spool(&mut self, path: &str) {
+            self.spool = Some(path.to_owned());
+        }
+
+        pub(crate) fn record_copy(&mut self, bytes: u64) {
+            self.bytes_copied = Some(bytes);
+        }
+
+        pub(crate) fn mark_authenticated(&mut self) {
+            self.authentication_complete = true;
+        }
+
+        pub(crate) fn mark_published(&mut self) {
+            self.published = true;
+            self.target_after = self.output.as_deref().map(object_identity);
+            self.old_file_preserved = None;
+            self.old_file_replaced = Some(
+                self.target_before
+                    .as_deref()
+                    .is_some_and(|identity| identity != "absent"),
+            );
+        }
+
+        pub(crate) fn mark_failed_before_commit(&mut self) {
+            if let Some(path) = self.output.as_deref() {
+                let after = object_identity(path);
+                self.target_after = Some(after.clone());
+                self.old_file_preserved = Some(self.target_before.as_ref() == Some(&after));
+            }
+            if let Some(spool) = self.spool.as_deref() {
+                self.spool_size = fs::metadata(spool).ok().map(|m| m.len());
+            }
+        }
+    }
+
+    fn object_identity(path: &str) -> String {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return "absent".to_owned();
+        };
+
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            format!(
+                "dev={};ino={};type={};size={};mtime_ns={modified_nanos}",
+                metadata.dev(),
+                metadata.ino(),
+                if metadata.file_type().is_symlink() {
+                    "symlink"
+                } else if metadata.is_file() {
+                    "file"
+                } else {
+                    "other"
+                },
+                metadata.len(),
+            )
+        }
+
+        #[cfg(not(unix))]
+        {
+            format!(
+                "type={};size={};mtime_ns={modified_nanos}",
+                if metadata.file_type().is_symlink() {
+                    "symlink"
+                } else if metadata.is_file() {
+                    "file"
+                } else {
+                    "other"
+                },
+                metadata.len(),
+            )
+        }
+    }
+
+    fn reason_code(error: &DecryptError) -> &'static str {
+        use age::DecryptError as AgeError;
+
+        match error {
+            DecryptError::Age(AgeError::DecryptionFailed) => "payload_authentication_failed",
+            DecryptError::Age(AgeError::InvalidMac) => "header_authentication_failed",
+            DecryptError::Age(AgeError::NoMatchingKeys) => "no_matching_identity",
+            DecryptError::Age(AgeError::InvalidHeader) => "invalid_header",
+            DecryptError::Age(AgeError::UnknownFormat) => "unknown_format",
+            DecryptError::Age(AgeError::KeyDecryptionFailed) => "key_decryption_failed",
+            DecryptError::Age(AgeError::ExcessiveWork { .. }) => "excessive_work",
+            DecryptError::Age(AgeError::Io(_)) => "age_io_error",
+            DecryptError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                "payload_authentication_failed_or_invalid_framing"
+            }
+            DecryptError::Io(_) => "input_or_output_io_error",
+            DecryptError::MissingIdentities { .. } => "missing_identities",
+            DecryptError::IdentityRead(_) => "identity_read_error",
+            DecryptError::PassphraseTimedOut => "passphrase_timeout",
+            _ => "decrypt_rejected",
+        }
+    }
+
+    fn json_escape(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0c}' => out.push_str("\\f"),
+                ch if (ch as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", ch as u32));
+                }
+                ch => out.push(ch),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Writes `security-receipt.json` and appends one JSONL event to
+    /// `security-receipt.jsonl` in the process's current directory.
+    ///
+    /// Audit writing is best-effort: an unwritable audit directory must not change the
+    /// decryption result or replace the CLI's normal error contract.
+    pub(crate) fn write_decrypt_receipt(audit: &DecryptAudit, result: &Result<(), DecryptError>) {
+        let recorded_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let (status, reason, message) = match result {
+            Ok(()) if audit.published => ("published", "complete_authentication", String::new()),
+            Ok(()) => (
+                "completed_without_publication",
+                "no_output_committed",
+                String::new(),
+            ),
+            Err(error) => (
+                "rejected",
+                reason_code(error),
+                error
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+        };
+
+        let output_kind = match audit.output.as_deref() {
+            None | Some("-") => "stdout",
+            Some(_) => "atomic-file",
+        };
+        let publication = if audit.published {
+            "published-after-complete-authentication"
+        } else {
+            "withheld-spool-discarded-or-uncommitted"
+        };
+
+        let mut json = String::new();
+        json.push_str("{\n");
+        let _ = writeln!(json, "  \"schema_version\": 1,");
+        let _ = writeln!(
+            json,
+            "  \"task_id\": \"rage-t02-partial-plaintext-publish\","
+        );
+        let _ = writeln!(json, "  \"event\": \"partial_plaintext_commit_gate\",");
+        let _ = writeln!(
+            json,
+            "  \"risk\": \"partial plaintext publication before complete authentication\","
+        );
+        let _ = writeln!(json, "  \"operation\": \"decrypt\",");
+        let _ = writeln!(json, "  \"recorded_at\": {},", json_escape(&recorded_at));
+        let _ = writeln!(
+            json,
+            "  \"generation\": {},",
+            json_escape(&audit.generation)
+        );
+        let _ = writeln!(json, "  \"status\": {},", json_escape(status));
+        let _ = writeln!(json, "  \"reason_code\": {},", json_escape(reason));
+        let _ = writeln!(json, "  \"message\": {},", json_escape(&message));
+        let _ = writeln!(
+            json,
+            "  \"input\": {},",
+            json_escape(audit.input.as_deref().unwrap_or("-"))
+        );
+        let _ = writeln!(
+            json,
+            "  \"output\": {},",
+            json_escape(audit.output.as_deref().unwrap_or("-"))
+        );
+        let _ = writeln!(json, "  \"output_kind\": {},", json_escape(output_kind));
+        let _ = writeln!(json, "  \"publication\": {},", json_escape(publication));
+        let _ = writeln!(
+            json,
+            "  \"authentication_complete\": {},",
+            audit.authentication_complete
+        );
+        let _ = writeln!(json, "  \"published\": {},", audit.published);
+        let _ = writeln!(
+            json,
+            "  \"old_file_preserved\": {},",
+            audit
+                .old_file_preserved
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_owned())
+        );
+        let _ = writeln!(
+            json,
+            "  \"old_file_replaced\": {},",
+            audit
+                .old_file_replaced
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_owned())
+        );
+        let _ = writeln!(
+            json,
+            "  \"target_generation_before\": {},",
+            audit
+                .target_before
+                .as_deref()
+                .map(json_escape)
+                .unwrap_or_else(|| "null".to_owned())
+        );
+        let _ = writeln!(
+            json,
+            "  \"target_generation_after\": {},",
+            audit
+                .target_after
+                .as_deref()
+                .map(json_escape)
+                .unwrap_or_else(|| "null".to_owned())
+        );
+        let _ = writeln!(
+            json,
+            "  \"spool\": {},",
+            audit
+                .spool
+                .as_deref()
+                .map(json_escape)
+                .unwrap_or_else(|| "null".to_owned())
+        );
+        let _ = writeln!(
+            json,
+            "  \"spool_size\": {},",
+            audit
+                .spool_size
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_owned())
+        );
+        let _ = writeln!(
+            json,
+            "  \"bytes_copied\": {},",
+            audit
+                .bytes_copied
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_owned())
+        );
+        json.push_str(
+        "  \"commit_boundary\": \"copy complete and authenticated; flush; sync; atomic rename\"\n",
+    );
+        json.push_str("}\n");
+
+        let _ = fs::write("security-receipt.json", &json);
+
+        let event_path = PathBuf::from("security-receipt.jsonl");
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&event_path)
+        {
+            let compact = json
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(file, "{compact}");
+            let _ = file.sync_all();
+        }
     }
 }

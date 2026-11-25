@@ -1,12 +1,13 @@
 //! File I/O helpers for CLI binaries.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use is_terminal::IsTerminal;
 use zeroize::Zeroize;
@@ -319,6 +320,309 @@ impl io::Write for LazyFile {
 
     fn flush(&mut self) -> io::Result<()> {
         self.get_file()?.flush()
+    }
+}
+
+/// A file output that is only published after the caller explicitly commits it.
+///
+/// Plaintext is written to a uniquely-named temporary file in the same directory as
+/// `destination`. Calling [`AtomicFile::finish`] flushes and syncs the spool before
+/// atomically renaming it over `destination`. If the value is dropped before that point,
+/// or [`AtomicFile::abort`] is called, the spool is removed and `destination` is left
+/// untouched.
+#[derive(Debug)]
+pub struct AtomicFile {
+    destination: PathBuf,
+    temporary: PathBuf,
+    file: Option<File>,
+    mode: u32,
+    committed: bool,
+}
+
+impl AtomicFile {
+    /// Creates a new private spool next to `destination`.
+    ///
+    /// When replacing an existing destination, the destination's permissions are copied at
+    /// commit time. New files use `mode` subject to the process umask.
+    pub fn create(destination: impl Into<PathBuf>, mode: u32) -> io::Result<Self> {
+        let destination = destination.into();
+        let file_name = destination.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                FileError::InvalidFilename(destination.display().to_string()),
+            )
+        })?;
+        let parent = destination
+            .parent()
+            .map(|p| {
+                if p.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    p
+                }
+            })
+            .unwrap_or_else(|| Path::new("."));
+
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                FileError::MissingDirectory(parent.display().to_string()),
+            ));
+        }
+
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let process_id = std::process::id();
+        let file_name = file_name.to_string_lossy();
+
+        for _ in 0..10_000 {
+            let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temporary = parent.join(format!(
+                ".{file_name}.rage-spool-{process_id}-{counter}.tmp"
+            ));
+
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                // Keep the plaintext spool private until commit. Its final mode is set just
+                // before the atomic rename.
+                options.mode(0o600);
+            }
+
+            match options.open(&temporary) {
+                Ok(file) => {
+                    return Ok(Self {
+                        destination,
+                        temporary,
+                        file: Some(file),
+                        mode,
+                        committed: false,
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to create temporary output file '{}': {e}",
+                            temporary.display()
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique temporary output file",
+        ))
+    }
+
+    /// Returns the final destination path.
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Returns the not-yet-published spool path.
+    pub fn temporary(&self) -> &Path {
+        &self.temporary
+    }
+
+    /// Flushes, syncs, preserves existing permissions, and atomically publishes output.
+    pub fn finish(mut self) -> io::Result<()> {
+        let mut file = self.file.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "temporary output file is closed")
+        })?;
+
+        file.flush()?;
+
+        // Preserve the explicit mode of an existing file. For a new file, the mode supplied
+        // to `create` was already intersected with the umask by the kernel.
+        #[cfg(unix)]
+        {
+            if let Ok(existing) = fs::metadata(&self.destination) {
+                file.set_permissions(existing.permissions())?;
+            } else {
+                let parent = self
+                    .temporary
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+                let mode = effective_create_mode(&parent, self.mode)?;
+                file.set_permissions(fs::Permissions::from_mode(mode))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = &self.mode;
+
+        file.sync_all()?;
+        // Close the spool before renaming; this is required for reliable replacement on
+        // platforms such as Windows and is harmless on Unix.
+        drop(file);
+
+        fs::rename(&self.temporary, &self.destination).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to publish temporary output '{}' to '{}': {e}",
+                    self.temporary.display(),
+                    self.destination.display()
+                ),
+            )
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Discards the spool without touching the destination.
+    pub fn abort(mut self) {
+        self.committed = false;
+        self.file = None;
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+
+#[cfg(unix)]
+fn effective_create_mode(directory: &Path, requested: u32) -> io::Result<u32> {
+    static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let path = directory.join(format!(
+        ".rage-mode-probe-{}-{}.tmp",
+        std::process::id(),
+        PROBE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(requested)
+        .open(&path)?;
+    let mode = file.metadata()?.permissions().mode() & 0o7777;
+    drop(file);
+    let _ = fs::remove_file(&path);
+    Ok(mode)
+}
+
+impl io::Write for AtomicFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file
+            .as_mut()
+            .expect("AtomicFile used after close")
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.flush()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for AtomicFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.file = None;
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+/// A private temporary spool used to withhold stdout until decryption is complete.
+#[derive(Debug)]
+pub struct TemporarySpool {
+    path: PathBuf,
+    file: Option<File>,
+    committed: bool,
+}
+
+impl TemporarySpool {
+    /// Creates a private spool in the current directory, falling back to `TMPDIR`.
+    pub fn new() -> io::Result<Self> {
+        Self::new_in(Path::new(".")).or_else(|first| {
+            let temp_dir = std::env::temp_dir();
+            Self::new_in(&temp_dir).map_err(|second| {
+                io::Error::new(
+                    second.kind(),
+                    format!(
+                        "could not create stdout spool in current directory ({first}) or {} ({second})",
+                        temp_dir.display()
+                    ),
+                )
+            })
+        })
+    }
+
+    fn new_in(directory: &Path) -> io::Result<Self> {
+        static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let process_id = std::process::id();
+
+        for _ in 0..10_000 {
+            let counter = SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!(".rage-stdout-spool-{process_id}-{counter}.tmp"));
+            let mut options = OpenOptions::new();
+            options.write(true).read(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+
+            match options.open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        committed: false,
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique temporary spool",
+        ))
+    }
+
+    /// Copies the complete, authenticated spool to the final stdout writer.
+    pub fn publish_to<W: Write>(mut self, writer: &mut W) -> io::Result<u64> {
+        let file = self.file.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "temporary spool is closed")
+        })?;
+        file.flush()?;
+        file.seek(SeekFrom::Start(0))?;
+        let copied = io::copy(file, writer)?;
+        writer.flush()?;
+        self.committed = true;
+        Ok(copied)
+    }
+}
+
+impl io::Write for TemporarySpool {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file
+            .as_mut()
+            .expect("TemporarySpool used after close")
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.flush()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for TemporarySpool {
+    fn drop(&mut self) {
+        self.file = None;
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        } else {
+            // `publish_to` has already copied and flushed; unlink the now-closed path.
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
