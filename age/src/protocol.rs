@@ -206,13 +206,39 @@ impl<R> Decryptor<R> {
 
     fn obtain_payload_key<'a>(
         &self,
-        mut identities: impl Iterator<Item = &'a dyn Identity>,
+        identities: impl Iterator<Item = &'a dyn Identity>,
     ) -> Result<PayloadKey, DecryptError> {
         match &self.header {
-            Header::V1(header) => identities
-                .find_map(|key| key.unwrap_stanzas(&header.recipients))
-                .unwrap_or(Err(DecryptError::NoMatchingKeys))
-                .and_then(|file_key| v1_payload_key(&file_key, header, &self.nonce)),
+            Header::V1(header) => {
+                let identities = identities.collect::<Vec<_>>();
+
+                // Enforce the scrypt work-factor limit before any identity is allowed to
+                // allocate memory or perform key derivation. All supplied identities are
+                // consulted so that an explicitly raised limit on a scrypt identity is
+                // preserved, while the protocol default is used when none is available.
+                let max_work_factor = identities
+                    .iter()
+                    .filter_map(|identity| identity.max_work_factor())
+                    .max()
+                    .unwrap_or(scrypt::DEFAULT_MAX_WORK_FACTOR);
+
+                if header.valid_scrypt() {
+                    if let Some(log_n) = scrypt::declared_work_factor(&header.recipients[0]) {
+                        if log_n > max_work_factor {
+                            return Err(DecryptError::ExcessiveWork {
+                                required: log_n,
+                                target: scrypt::DEFAULT_MAX_WORK_FACTOR.min(log_n),
+                            });
+                        }
+                    }
+                }
+
+                identities
+                    .into_iter()
+                    .find_map(|key| key.unwrap_stanzas(&header.recipients))
+                    .unwrap_or(Err(DecryptError::NoMatchingKeys))
+                    .and_then(|file_key| v1_payload_key(&file_key, header, &self.nonce))
+            }
             Header::Unknown(_) => unreachable!(),
         }
     }
@@ -498,6 +524,28 @@ mod tests {
         r.read_to_end(&mut decrypted).unwrap();
 
         assert_eq!(&decrypted[..], &test_msg[..]);
+    }
+
+    #[test]
+    fn decryptor_rejects_excessive_scrypt_work_before_identities() {
+        // A structurally valid scrypt header that declares a work factor above the
+        // protocol maximum. We intentionally provide no identities: the public
+        // decryptor must enforce the default limit itself, before any identity (or
+        // scrypt allocation) is involved.
+        let mut encrypted = b"age-encryption.org/v1\n\
+            -> scrypt rF0/NwblUHHTpgQgRpe5CQ 23\n\
+            AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
+            --- AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+            .to_vec();
+        encrypted.extend_from_slice(&[0; 16]);
+
+        let decryptor = Decryptor::new(&encrypted[..]).unwrap();
+        assert!(decryptor.is_scrypt());
+
+        match decryptor.decrypt(iter::empty()) {
+            Err(crate::DecryptError::ExcessiveWork { required: 23, .. }) => {}
+            _ => panic!("decryptor did not reject excessive scrypt work"),
+        }
     }
 
     #[cfg(feature = "ssh")]

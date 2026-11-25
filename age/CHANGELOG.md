@@ -10,6 +10,21 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Added
+- `age::Identity::max_work_factor`, which lets an identity report the maximum
+  scrypt work factor it will process. `age::Decryptor` uses this to enforce the
+  limit before invoking any identity.
+
+### Security
+- Passphrase-encrypted files can no longer force excessive scrypt work before the
+  header is authenticated. `age::scrypt::Identity` now defaults to rejecting work
+  factors above the protocol limit of 22 (`age::scrypt::DEFAULT_MAX_WORK_FACTOR`)
+  instead of deriving a machine-specific limit (`target + 4`), which could exceed
+  22 on fast machines and allow a malicious header to trigger multi-gigabyte
+  allocations and long computations. The public `age::Decryptor` now enforces the
+  same limit before invoking any identity. Explicitly higher limits remain
+  available through `age::scrypt::Identity::set_max_work_factor`.
+
 ### Changed
 - MSRV is now 1.85.0.
 - Migrated to `chacha20poly1305 0.11`, `curve25519-dalek 5`, `hmac 0.13`,

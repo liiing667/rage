@@ -374,11 +374,12 @@ impl fmt::Display for DecryptError {
             DecryptError::DecryptionFailed => wfl!(f, "err-decryption-failed"),
             DecryptError::ExcessiveWork { required, target } => {
                 wlnfl!(f, "err-excessive-work")?;
-                wfl!(
-                    f,
-                    "rec-excessive-work",
-                    duration = (1 << (required - target)),
-                )
+                // Clamp the exponent so that a malicious (or explicitly permitted)
+                // work factor cannot panic while formatting the error.
+                let duration = 1u128
+                    .checked_shl((*required).saturating_sub(*target) as u32)
+                    .unwrap_or(u128::MAX);
+                wfl!(f, "rec-excessive-work", duration = duration,)
             }
             DecryptError::InvalidHeader => wfl!(f, "err-header-invalid"),
             DecryptError::InvalidMac => wfl!(f, "err-header-mac-invalid"),

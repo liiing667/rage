@@ -12,6 +12,15 @@ to 1.0.0 are beta releases.
 
 ## [Unreleased]
 
+### Security
+- `rage -d` now rejects passphrase-encrypted files whose declared scrypt work
+  factor exceeds the protocol default of 22 before performing any scrypt
+  allocation or computation. Previously the default limit was derived from a
+  local benchmark and could exceed 22 on fast machines, allowing a malicious file
+  header to consume significant CPU and memory before authentication. Files that
+  legitimately require a higher work factor can still be decrypted with
+  `--max-work-factor`.
+
 ### Changed
 - MSRV is now 1.85.0.
 - MSRV for `rage-mount` (behind the `mount` feature flag) is now 1.88.0.

@@ -28,12 +28,25 @@ pub(crate) const SCRYPT_RECIPIENT_TAG: &str = "scrypt";
 const SCRYPT_SALT_LABEL: &[u8] = b"age-encryption.org/v1/scrypt";
 const ONE_SECOND: Duration = Duration::from_secs(1);
 
+/// The default maximum scrypt work factor that will be accepted when decrypting.
+///
+/// This matches the limit accepted by the age test vectors and the reference
+/// implementation. Bounding the work factor before any scrypt allocation or
+/// computation prevents a malicious header from forcing an unbounded amount of CPU
+/// and memory usage before the file can be authenticated.
+///
+/// Applications that need to decrypt files with a higher work factor can opt in
+/// explicitly with [`Identity::set_max_work_factor`].
+pub const DEFAULT_MAX_WORK_FACTOR: u8 = 22;
+
 const SALT_LEN: usize = 16;
 const ENCRYPTED_FILE_KEY_BYTES: usize = FILE_KEY_BYTES + 16;
 
 /// Pick an scrypt work factor that will take around 1 second on this device.
 ///
-/// Guaranteed to return a valid work factor (less than 64).
+/// Guaranteed to return a valid work factor (less than 64), and capped at
+/// [`DEFAULT_MAX_WORK_FACTOR`] so that files encrypted with the default work factor
+/// can always be decrypted with the default maximum work factor.
 fn target_scrypt_work_factor() -> u8 {
     let measure_duration = |log_n| {
         // Platforms that have a functional SystemTime::now():
@@ -91,6 +104,7 @@ fn target_scrypt_work_factor() -> u8 {
             // Couldn't measure, so guess. This is roughly 1 second on a modern machine.
             18
         })
+        .min(DEFAULT_MAX_WORK_FACTOR)
 }
 
 /// A passphrase-based recipient. Anyone with the passphrase can decrypt the file.
@@ -112,7 +126,8 @@ impl Recipient {
     /// Constructs a new `Recipient` with the given passphrase.
     ///
     /// The scrypt work factor is picked to target about 1 second for encryption or
-    /// decryption on this device. Override it with [`Self::set_work_factor`].
+    /// decryption on this device, capped at [`DEFAULT_MAX_WORK_FACTOR`]. Override it
+    /// with [`Self::set_work_factor`].
     pub fn new(passphrase: SecretString) -> Self {
         Self {
             passphrase,
@@ -171,9 +186,10 @@ impl crate::Recipient for Recipient {
 /// A passphrase-based identity. Anyone with the passphrase can decrypt the file.
 ///
 /// The identity caps the amount of work that the [`Decryptor`] might have to do to
-/// process received files. A fairly high default is used (targeting roughly 16 seconds of
-/// work per stanza on the current machine), which might not be suitable for systems
-/// processing untrusted files.
+/// process received files. Work factors above [`DEFAULT_MAX_WORK_FACTOR`] are rejected
+/// before any scrypt memory is allocated or computation begins, which prevents malicious
+/// files from causing a denial of service. This limit can be raised explicitly with
+/// [`Self::set_max_work_factor`] for files that are known to use a higher work factor.
 ///
 /// [`Decryptor`]: crate::Decryptor
 pub struct Identity {
@@ -187,8 +203,13 @@ impl Identity {
     pub fn new(passphrase: SecretString) -> Self {
         let target_work_factor = target_scrypt_work_factor();
 
-        // Place bounds on the work factor we will accept (roughly 16 seconds).
-        let max_work_factor = target_work_factor + 4;
+        // Bound the work factor we will accept by default. This is deliberately a
+        // fixed protocol limit rather than a machine-specific value: otherwise a fast
+        // machine can derive a limit that permits multi-gigabyte scrypt allocations
+        // from an unauthenticated, attacker-controlled file header.
+        let max_work_factor = target_work_factor
+            .saturating_add(4)
+            .min(DEFAULT_MAX_WORK_FACTOR);
 
         Self {
             passphrase,
@@ -203,10 +224,10 @@ impl Identity {
     ///
     /// # Security
     ///
-    /// This sets the bounds on CPU/memory cost. Large values (e.g. > 22) can allow
-    /// attempted decryption of a malicious file that takes hours and tens of GiB of RAM.
-    /// When setting this value in your application, take care to limit it appropriately
-    /// and avoid Denial-of-Service issues.
+    /// This sets the bounds on CPU/memory cost. The default is
+    /// [`DEFAULT_MAX_WORK_FACTOR`]. Large values can allow attempted decryption of a
+    /// malicious file that takes hours and tens of GiB of RAM, so only raise this for
+    /// files you trust to use a higher work factor.
     ///
     /// [`Self::unwrap_stanza`]: crate::Identity::unwrap_stanza
     pub fn set_max_work_factor(&mut self, max_log_n: u8) {
@@ -214,7 +235,32 @@ impl Identity {
     }
 }
 
+/// Returns the work factor declared by a scrypt recipient stanza.
+///
+/// Returns `None` if the stanza is not a well-formed scrypt stanza. The caller is
+/// expected to let [`Identity::unwrap_stanza`] report the appropriate header error in
+/// that case.
+pub(crate) fn declared_work_factor(stanza: &Stanza) -> Option<u8> {
+    if stanza.tag != SCRYPT_RECIPIENT_TAG {
+        return None;
+    }
+
+    match &stanza.args[..] {
+        [salt, log_n]
+            if stanza.body.len() == ENCRYPTED_FILE_KEY_BYTES
+                && base64_arg::<_, SALT_LEN, 18>(salt).is_some() =>
+        {
+            decimal_digit_arg(log_n)
+        }
+        _ => None,
+    }
+}
+
 impl crate::Identity for Identity {
+    fn max_work_factor(&self) -> Option<u8> {
+        Some(self.max_work_factor)
+    }
+
     fn unwrap_stanza(&self, stanza: &Stanza) -> Option<Result<FileKey, DecryptError>> {
         if stanza.tag != SCRYPT_RECIPIENT_TAG {
             return None;
@@ -236,6 +282,8 @@ impl crate::Identity for Identity {
             return Some(Err(DecryptError::InvalidHeader));
         }
 
+        // Enforce the resource limit before allocating scrypt's scratch space or
+        // performing any key derivation.
         if log_n > self.max_work_factor {
             return Some(Err(DecryptError::ExcessiveWork {
                 required: log_n,
@@ -275,5 +323,50 @@ impl crate::Identity for Identity {
                 })
                 .map_err(DecryptError::from),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Identity as _;
+
+    fn test_identity() -> Identity {
+        Identity::new(SecretString::from("password".to_owned()))
+    }
+
+    fn test_stanza(log_n: u8) -> Stanza {
+        Stanza {
+            tag: SCRYPT_RECIPIENT_TAG.to_owned(),
+            args: vec!["rF0/NwblUHHTpgQgRpe5CQ".to_owned(), log_n.to_string()],
+            body: vec![0; ENCRYPTED_FILE_KEY_BYTES],
+        }
+    }
+
+    #[test]
+    fn default_work_factor_limits() {
+        let recipient = Recipient::new(SecretString::from("password".to_owned()));
+        assert!(recipient.log_n <= DEFAULT_MAX_WORK_FACTOR);
+
+        let identity = test_identity();
+        assert!(identity.target_work_factor <= DEFAULT_MAX_WORK_FACTOR);
+        assert!(identity.max_work_factor <= DEFAULT_MAX_WORK_FACTOR);
+
+        // A work factor one above the protocol limit must be rejected before scrypt is
+        // invoked. If this regresses on a fast machine, the test will attempt an
+        // 8 GiB scrypt computation instead of returning immediately.
+        match identity.unwrap_stanza(&test_stanza(DEFAULT_MAX_WORK_FACTOR + 1)) {
+            Some(Err(DecryptError::ExcessiveWork { required, .. })) => {
+                assert_eq!(required, DEFAULT_MAX_WORK_FACTOR + 1);
+            }
+            _ => panic!("work factor above the default limit should be rejected"),
+        }
+    }
+
+    #[test]
+    fn explicit_higher_work_factor_is_preserved() {
+        let mut identity = test_identity();
+        identity.set_max_work_factor(DEFAULT_MAX_WORK_FACTOR + 1);
+        assert_eq!(identity.max_work_factor, DEFAULT_MAX_WORK_FACTOR + 1);
     }
 }

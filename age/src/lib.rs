@@ -323,6 +323,19 @@ pub trait Identity {
     fn unwrap_stanzas(&self, stanzas: &[Stanza]) -> Option<Result<FileKey, DecryptError>> {
         stanzas.iter().find_map(|stanza| self.unwrap_stanza(stanza))
     }
+
+    /// Returns the maximum scrypt work factor that this identity is willing to process.
+    ///
+    /// [`Decryptor`] uses this to reject a header that declares excessive scrypt work
+    /// before asking any identity to unwrap it, ensuring that the resource limit is
+    /// enforced before scrypt allocates memory or performs computation.
+    ///
+    /// The default implementation returns `None`, meaning the identity does not process
+    /// scrypt stanzas. If no supplied identity reports a limit, [`Decryptor`] applies
+    /// [`scrypt::DEFAULT_MAX_WORK_FACTOR`].
+    fn max_work_factor(&self) -> Option<u8> {
+        None
+    }
 }
 
 /// A public key or other value that can wrap an opaque file key to a recipient stanza.
